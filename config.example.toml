@@ -1,0 +1,19 @@
+# Copy this file outside the Git checkout, for example to:
+# ~/.config/sync-box/config.toml
+
+[local]
+root = "/absolute/path/to/the/local-folder"
+
+[box]
+# Use "0" for the Box account root, or the ID from a Box folder URL.
+folder_id = "0"
+
+[sync]
+# Each relative path excludes that item and its entire subtree on both sides.
+exclude = [".Trash-1000"]
+# Match these filenames in every folder.
+exclude_names = ["Thumbs.db"]
+
+[storage]
+state_database = "/home/your-user/.local/state/sync-box/state.sqlite3"
+log_file = "/home/your-user/.local/state/sync-box/sync-box.log"

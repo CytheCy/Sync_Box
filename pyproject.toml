@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sync-box"
+version = "0.2.0"
+description = "Conservative two-way synchronization between a local folder and Box"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boxsdk>=10,<11",
+]
+
+[project.scripts]
+sync-box = "sync_box.cli:main"
+
+[tool.setuptools.package-data]
+sync_box = ["schema.sql", "migrations/*.sql"]
