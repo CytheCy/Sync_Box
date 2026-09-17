@@ -15,6 +15,7 @@ from sync_box.config import AppConfig
 BOX_CLI_ENVIRONMENT = "sync-box"
 MINIMUM_BOX_CLI_VERSION = (4, 6, 0)
 READ_ONLY_SCOPES = "root_readonly,item_download"
+READ_WRITE_SCOPES = "root_readwrite,item_download"
 
 
 class AuthenticationError(RuntimeError):
@@ -54,6 +55,14 @@ def build_authenticated_client(config: AppConfig) -> Any:
     return BoxClient(auth=BoxDeveloperTokenAuth(token))
 
 
+def build_write_authenticated_client(config: AppConfig) -> Any:
+    """Build a short-lived content read/write client for an executing sync."""
+    del config
+    token = _access_token(READ_WRITE_SCOPES, "read/write")
+    BoxClient, BoxDeveloperTokenAuth = _sdk_components()
+    return BoxClient(auth=BoxDeveloperTokenAuth(token))
+
+
 def test_authentication(config: AppConfig) -> tuple[str, str]:
     client = build_authenticated_client(config)
     try:
@@ -67,18 +76,22 @@ def test_authentication(config: AppConfig) -> tuple[str, str]:
 
 def _read_only_access_token() -> str:
     """Exchange the CLI's credential for a non-refreshable read-only token."""
+    return _access_token(READ_ONLY_SCOPES, "read-only")
+
+
+def _access_token(scopes: str, label: str) -> str:
     executable = _box_cli_executable()
     result = _run_captured(
         [
             executable,
             "tokens:exchange",
-            READ_ONLY_SCOPES,
+            scopes,
             "--no-color",
         ]
     )
     if result.returncode != 0:
         detail = safe_error_detail(result.stderr)
-        message = "Box CLI could not issue a read-only token"
+        message = f"Box CLI could not issue a {label} token"
         if detail:
             message += f": {detail}"
         message += (
@@ -90,10 +103,10 @@ def _read_only_access_token() -> str:
     token = result.stdout.strip()
     if not token:
         raise AuthenticationError(
-            "Box CLI returned no read-only token despite reporting success"
+            f"Box CLI returned no {label} token despite reporting success"
         )
     if any(character.isspace() for character in token):
-        raise AuthenticationError("Box CLI returned an invalid read-only token")
+        raise AuthenticationError(f"Box CLI returned an invalid {label} token")
     return token
 
 

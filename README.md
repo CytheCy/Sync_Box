@@ -1,9 +1,10 @@
 # Sync Box
 
-`sync-box` is a conservative synchronization project for a normal Fedora folder
-and a Box folder. It uses the official Box CLI login and a downscoped read-only
-Box token. It can inventory and compare both sides and perform an initial
-Box-to-local download. It cannot write, rename, move, or delete anything on Box.
+`sync-box` is a conservative two-way synchronizer for a normal Fedora folder and
+a Box folder. It uses the official Box CLI login, verified SHA-1 inventories,
+an external SQLite baseline, and short-lived downscoped tokens. Inventories and
+dry runs use read-only access. An executing sync obtains a separate content
+read/write token only for that run.
 
 ## Install on Fedora
 
@@ -132,19 +133,19 @@ but never traversed.
 
 ## Database and logs
 
-Initialize a new database or migrate a Step 1 database from schema v1 to v2:
+Initialize a new database or migrate an older database to schema v3:
 
 ```bash
 .venv/bin/sync-box init
 ```
 
-The migration adds inventory-run and inventory-item tables while preserving the
-existing baseline, run, and conflict tables. Database and log files use mode
-`0600`; logs rotate at 5 MiB and keep three backups.
+The migrations preserve existing data and add paired baseline generations and
+an operation journal. Database and log files use mode `0600`; logs rotate at 5
+MiB and keep three backups.
 
-## Comparison and initial download
+## Baseline and two-way synchronization
 
-Compare live local file hashes with Box SHA-1 metadata and print review items:
+Before a baseline exists, compare live local file hashes with Box SHA-1 metadata:
 
 ```bash
 .venv/bin/sync-box run --dry-run --summary-only
@@ -155,8 +156,59 @@ Matching files and folders are counted but omitted from the table. One-sided
 items, type mismatches, unsupported types, unavailable hashes, and differing
 content are reported for review. Because no common baseline exists yet, it does
 not choose upload, download, or delete directions. Omit `--summary-only` for the
-full review table, or add `--json` for structured review output. General
-non-dry synchronization remains unavailable.
+full review table, or add `--json` for structured review output.
+
+Once both trees are expected to match, create the baseline:
+
+```bash
+.venv/bin/sync-box baseline create
+.venv/bin/sync-box baseline status
+```
+
+Creation performs fresh local and Box inventories. It refuses the database
+write unless every non-excluded path and type matches and every file has a
+matching SHA-1. The atomic generation records local stat identity and Box IDs,
+versions, ETags, hashes, sizes, and timestamps.
+
+With a baseline, `run --dry-run` prints exact upload, download, delete, move,
+and conflict actions. Box IDs track remote moves; local device/inode identity is
+used only as a conservative move hint. Concurrent edits, occupied destinations,
+replaced Box identities, unsupported items, and ambiguities become conflicts.
+The dry run never obtains a write-capable token.
+
+After reviewing a conflict-free plan, execution is explicit:
+
+```bash
+.venv/bin/sync-box run
+```
+
+Execution rejects any plan containing a conflict before changing either tree.
+It journals each operation, revalidates files before upload, uses Box ETag
+preconditions, verifies downloads in temporary files, fsyncs them, and publishes
+them atomically. It never follows symlinks or accepts paths outside the root.
+Token-expiration retries are bounded. An interrupted run keeps the prior
+baseline, so a fresh inventory can safely plan the remaining work. A new
+baseline is committed only after all actions complete and another pair of fresh
+inventories proves that the trees match.
+
+## Keep-both conflict resolution engine
+
+The shared engine exposes structured keep-both planning and execution through
+`sync_box.conflict_resolution`. The first policy keeps the Box version at the
+original path and preserves the divergent local version under a deterministic
+name containing its SHA-1 prefix. Plans bind the baseline generation, local
+fingerprint, Box item/version/ETag, and both paths before any mutation.
+
+Resolution execution uses a durable operation journal. It uploads and verifies
+the conflict copy without ambiguous mutation retries, publishes the local copy
+with atomic no-clobber filesystem operations, and downloads the exact Box
+version through the existing verified download path. Ordinary synchronization
+and direct baseline replacement are refused while a resolution is incomplete.
+The verified replacement baseline and completed resolution record commit in one
+SQLite transaction. These APIs contain no CLI presentation logic and can be
+called by either a command-line workflow or a desktop GUI.
+
+## Initial download
 
 For an empty or partially downloaded local root, build an explicit initial
 Box-to-local plan and display the first ten actions:

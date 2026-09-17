@@ -11,6 +11,7 @@ from sync_box.box_auth import (
     _read_only_access_token,
     authorize,
     build_authenticated_client,
+    build_write_authenticated_client,
 )
 
 
@@ -130,6 +131,20 @@ class AuthenticationTests(unittest.TestCase):
         self.assertIs(result, client)
         auth_factory.assert_called_once_with("token")
         client_factory.assert_called_once_with(auth=auth)
+
+    @patch("sync_box.box_auth._access_token", return_value="write-token")
+    @patch("sync_box.box_auth._sdk_components")
+    def test_write_client_requests_separate_content_scope(
+        self, components: Mock, token: Mock
+    ) -> None:
+        auth_factory = Mock(return_value="auth")
+        client_factory = Mock(return_value="client")
+        components.return_value = client_factory, auth_factory
+
+        self.assertEqual(build_write_authenticated_client(SimpleNamespace()), "client")
+
+        token.assert_called_once_with("root_readwrite,item_download", "read/write")
+        auth_factory.assert_called_once_with("write-token")
 
     @patch("sync_box.box_auth.shutil.which", return_value=None)
     def test_missing_cli_has_actionable_error(self, _which: Mock) -> None:

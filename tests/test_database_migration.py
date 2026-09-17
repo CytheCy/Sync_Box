@@ -33,7 +33,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 4)
             self.assertEqual(baseline, "kept.txt")
             self.assertIn("inventory_items", tables)
 
