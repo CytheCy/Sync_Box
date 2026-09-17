@@ -135,6 +135,10 @@ class ExecutorTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "root"; self.root.mkdir()
         self.db = Path(self.temp.name) / "state.db"
+        self.generation = replace_baseline(
+            self.db, local_root=str(self.root), box_root_id="0",
+            local_items=[ROOT_PAIR[0]], box_items=[ROOT_PAIR[1]],
+        )
     def tearDown(self) -> None: self.temp.cleanup()
 
     def test_download_is_verified_and_published(self) -> None:
@@ -142,6 +146,7 @@ class ExecutorTests(unittest.TestCase):
         action = build_sync_plan([ROOT_PAIR], [ROOT_PAIR[0]],
                                  [ROOT_PAIR[1], box("new", content, item_id="20")])[0]
         result = execute_sync(FakeBox({"20": content}), self.root, self.db, [action],
+                              baseline_generation=self.generation,
                               box_items_by_path={".": ROOT_PAIR[1]})
         self.assertEqual(result.completed, 1)
         self.assertEqual((self.root / "new").read_bytes(), content)
@@ -160,8 +165,10 @@ class ExecutorTests(unittest.TestCase):
     def test_conflict_preflight_makes_no_changes(self) -> None:
         action = self._conflict()
         with self.assertRaisesRegex(SyncExecutionError, "conflict"):
-            execute_sync(FakeBox(), self.root, self.db, [action], box_items_by_path={})
-        self.assertFalse(self.db.exists())
+            execute_sync(FakeBox(), self.root, self.db, [action],
+                         baseline_generation=self.generation, box_items_by_path={})
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM sync_runs").fetchone()[0], 0)
 
     def _conflict(self):
         return self._action("conflict", "a")
@@ -172,22 +179,25 @@ class ExecutorTests(unittest.TestCase):
 
     def test_unsafe_path_and_symlink_parent_are_rejected(self) -> None:
         with self.assertRaises(SyncExecutionError):
-            execute_sync(FakeBox(), self.root, self.db, [self._action("download_new", "../escape")], box_items_by_path={})
+            execute_sync(FakeBox(), self.root, self.db, [self._action("download_new", "../escape")],
+                         baseline_generation=self.generation, box_items_by_path={})
         outside = Path(self.temp.name) / "outside"; outside.mkdir()
         (self.root / "link").symlink_to(outside, target_is_directory=True)
         action = self._action("download_new", "link/file", box_item_id="20", size=1, sha1=sha(b"x"))
         with self.assertRaises(SyncExecutionError):
-            execute_sync(FakeBox({"20": b"x"}), self.root, self.db, [action], box_items_by_path={})
+            execute_sync(FakeBox({"20": b"x"}), self.root, self.db, [action],
+                         baseline_generation=self.generation, box_items_by_path={})
         self.assertFalse((outside / "file").exists())
 
     def test_interruption_is_journaled_and_baseline_is_unchanged(self) -> None:
-        replace_baseline(self.db, local_root=str(self.root), box_root_id="0",
-                         local_items=[ROOT_PAIR[0]], box_items=[ROOT_PAIR[1]])
+        self.generation = replace_baseline(self.db, local_root=str(self.root), box_root_id="0",
+                                           local_items=[ROOT_PAIR[0]], box_items=[ROOT_PAIR[1]])
         before = load_baseline(self.db)[0]
         actions = [self._action("create_local_folder", "done", item_type="folder"),
                    self._action("download_new", "missing", box_item_id="99", size=1, sha1=sha(b"x"))]
         with self.assertRaises(SyncExecutionError):
-            execute_sync(FakeBox(), self.root, self.db, actions, box_items_by_path={})
+            execute_sync(FakeBox(), self.root, self.db, actions,
+                         baseline_generation=self.generation, box_items_by_path={})
         self.assertTrue((self.root / "done").is_dir())
         self.assertEqual(load_baseline(self.db)[0], before)
         with closing(sqlite3.connect(self.db)) as connection:
@@ -198,7 +208,8 @@ class ExecutorTests(unittest.TestCase):
         action = self._action("create_local_folder", "folder", item_type="folder")
         (self.root / "folder").write_bytes(b"collision")
         with self.assertRaises(SyncExecutionError):
-            execute_sync(FakeBox(), self.root, self.db, [action], box_items_by_path={})
+            execute_sync(FakeBox(), self.root, self.db, [action],
+                         baseline_generation=self.generation, box_items_by_path={})
 
     def test_upload_error_is_sanitized(self) -> None:
         (self.root / "a").write_bytes(b"data")
@@ -206,7 +217,8 @@ class ExecutorTests(unittest.TestCase):
         class Broken(FakeBox):
             def upload_new(self, *args): raise RuntimeError("Authorization: Bearer secret")
         with self.assertRaises(SyncExecutionError) as raised:
-            execute_sync(Broken(), self.root, self.db, [action], box_items_by_path={})
+            execute_sync(Broken(), self.root, self.db, [action],
+                         baseline_generation=self.generation, box_items_by_path={})
         self.assertNotIn("secret", str(raised.exception))
 
     def test_expired_download_token_refreshes_once(self) -> None:
@@ -220,7 +232,7 @@ class ExecutorTests(unittest.TestCase):
         calls = []
         def refresh(): calls.append(True); return replacement
         execute_sync(Expired(), self.root, self.db, [action], box_items_by_path={},
-                     refresh_box=refresh)
+                     baseline_generation=self.generation, refresh_box=refresh)
         self.assertEqual(len(calls), 1)
         self.assertEqual((self.root / "fresh").read_bytes(), content)
 

@@ -13,12 +13,13 @@ from typing import Any, Iterable
 from sync_box.inventory import InventoryItem
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MIGRATIONS = {
     1: "schema.sql",
     2: "migrations/0002_inventory.sql",
     3: "migrations/0003_sync_state.sql",
     4: "migrations/0004_conflict_resolution.sql",
+    5: "migrations/0005_sync_run_guard.sql",
 }
 
 
@@ -97,6 +98,8 @@ def replace_baseline(
     box_root_id: str,
     local_items: Iterable[InventoryItem],
     box_items: Iterable[InventoryItem],
+    expected_generation: int | None = None,
+    active_sync_run_id: int | None = None,
 ) -> int:
     """Atomically replace the successful-sync baseline with paired snapshots."""
     local = {item.relative_path: item for item in local_items}
@@ -114,6 +117,24 @@ def replace_baseline(
                 raise RuntimeError(
                     "Cannot replace baseline while conflict resolution "
                     f"{incomplete[0]} is incomplete"
+                )
+            running_syncs = connection.execute(
+                "SELECT id FROM sync_runs WHERE outcome='running'"
+            ).fetchall()
+            if any(int(row[0]) != active_sync_run_id for row in running_syncs):
+                raise RuntimeError(
+                    "Cannot replace baseline while another synchronization run is active"
+                )
+            current = connection.execute(
+                "SELECT generation_id FROM current_baseline WHERE singleton=1"
+            ).fetchone()
+            if expected_generation is not None and (
+                current is None or int(current[0]) != expected_generation
+            ):
+                found = "absent" if current is None else current[0]
+                raise RuntimeError(
+                    "Baseline generation changed before verified commit: "
+                    f"expected {expected_generation}, found {found}"
                 )
             if set(local) != set(remote):
                 raise ValueError("Cannot baseline inventories with different paths")
@@ -190,7 +211,13 @@ def load_baseline(path: Path) -> tuple[int, str, str, list[tuple[InventoryItem, 
     return int(header["id"]), str(header["local_root"]), str(header["box_root_id"]), pairs
 
 
-def begin_sync_run(path: Path, actions: Iterable[object]) -> int:
+def begin_sync_run(
+    path: Path,
+    actions: Iterable[object],
+    *,
+    baseline_generation: int,
+    local_root: str,
+) -> int:
     """Durably record the exact operation list before mutations begin."""
     initialize_database(path)
     action_list = list(actions)
@@ -205,14 +232,37 @@ def begin_sync_run(path: Path, actions: Iterable[object]) -> int:
                 raise RuntimeError(
                     f"Conflict resolution {incomplete[0]} is incomplete"
                 )
+            current = connection.execute(
+                "SELECT generation_id FROM current_baseline WHERE singleton=1"
+            ).fetchone()
+            if current is None or int(current[0]) != baseline_generation:
+                found = "absent" if current is None else current[0]
+                raise RuntimeError(
+                    "Baseline generation changed before synchronization: "
+                    f"expected {baseline_generation}, found {found}"
+                )
+            # The process-level file lock proves no other executor is active.
+            # Any surviving row is therefore an interrupted process, not a live peer.
+            connection.execute(
+                "UPDATE sync_runs SET finished_at=CURRENT_TIMESTAMP, outcome='failed', "
+                "summary='interrupted before completion' WHERE outcome='running'"
+            )
+            plan_json = json.dumps(
+                [getattr(action, "to_dict")() for action in action_list],
+                sort_keys=True,
+            )
             cursor = connection.execute(
-                "INSERT INTO sync_runs(started_at, dry_run, outcome) VALUES (CURRENT_TIMESTAMP, 0, 'running')"
+                "INSERT INTO sync_runs(started_at, dry_run, outcome, baseline_generation, "
+                "local_root, plan_json) VALUES (CURRENT_TIMESTAMP, 0, 'running', ?, ?, ?) ",
+                (baseline_generation, local_root, plan_json),
             )
             run_id = int(cursor.lastrowid)
             connection.executemany(
-                "INSERT INTO sync_operations(run_id, relative_path, action, status, detail) VALUES (?, ?, ?, 'pending', ?)",
+                "INSERT INTO sync_operations(run_id, relative_path, action, status, detail, step_order) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
                 ((run_id, getattr(a, "relative_path"), getattr(a, "action"),
-                  json.dumps(getattr(a, "to_dict")(), sort_keys=True)) for a in action_list),
+                  json.dumps(getattr(a, "to_dict")(), sort_keys=True), index)
+                 for index, a in enumerate(action_list, start=1)),
             )
     return run_id
 

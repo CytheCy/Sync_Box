@@ -386,6 +386,7 @@ class ConflictResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(SyncExecutionError, "resolution.*incomplete"):
             execute_sync(
                 FakeBox(self.h.remote), self.h.root, self.h.db, [],
+                baseline_generation=self.h.generation,
                 box_items_by_path={},
             )
         self.assert_baseline_unchanged()

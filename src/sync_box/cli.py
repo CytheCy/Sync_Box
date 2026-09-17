@@ -335,20 +335,24 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     if not args.dry_run:
         from sync_box.box_auth import build_write_authenticated_client
         write_client = build_write_authenticated_client(config)
-        execute_sync(
+        result = execute_sync(
             BoxMutations(write_client, config.box_folder_id), config.local_root,
             config.state_database, plan,
+            baseline_generation=generation,
             box_items_by_path={item.relative_path: item for item in box_items},
             refresh_box=lambda: BoxMutations(build_write_authenticated_client(config), config.box_folder_id),
+            revalidate_plan=lambda: build_sync_plan(
+                pairs,
+                *_fresh_inventories(config, build_authenticated_client(config)),
+            ),
+            verify_inventories=lambda: _fresh_inventories(
+                config, build_authenticated_client(config)
+            ),
         )
-        # A new baseline is committed only after independent fresh inventories verify equality.
-        verified_local, verified_box = _fresh_inventories(config, build_authenticated_client(config))
-        validate_baseline_match(verified_local, verified_box)
-        new_generation = replace_baseline(
-            config.state_database, local_root=str(config.local_root), box_root_id=config.box_folder_id,
-            local_items=verified_local, box_items=verified_box,
+        print(
+            "Synchronization complete and verified; baseline generation="
+            f"{result.new_baseline_generation}"
         )
-        print(f"Synchronization complete and verified; baseline generation={new_generation}")
     return 0
 
 

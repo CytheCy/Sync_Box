@@ -133,15 +133,16 @@ but never traversed.
 
 ## Database and logs
 
-Initialize a new database or migrate an older database to schema v3:
+Initialize a new database or migrate an older database to schema v5:
 
 ```bash
 .venv/bin/sync-box init
 ```
 
-The migrations preserve existing data and add paired baseline generations and
-an operation journal. Database and log files use mode `0600`; logs rotate at 5
-MiB and keep three backups.
+The migrations preserve existing data and add paired baseline generations, an
+operation journal, generation-bound sync runs, and a single-running-sync guard.
+Database and log files use mode `0600`; logs rotate at 5 MiB and keep three
+backups.
 
 ## Baseline and two-way synchronization
 
@@ -183,13 +184,20 @@ After reviewing a conflict-free plan, execution is explicit:
 ```
 
 Execution rejects any plan containing a conflict before changing either tree.
-It journals each operation, revalidates files before upload, uses Box ETag
-preconditions, verifies downloads in temporary files, fsyncs them, and publishes
-them atomically. It never follows symlinks or accepts paths outside the root.
+It journals each operation, binds the run to its baseline generation, and holds
+a nonblocking lock on both the local root and state database through mutation
+and verification. The exact plan is rebuilt under those locks and must remain
+unchanged before journaling. Files are
+revalidated before upload. Folder actions are bound to inventoried device/inode
+identity and subtree state. Local moves use an atomic no-clobber rename; Box
+folder deletion is always non-recursive. Box mutations use ETag preconditions,
+and downloads are verified in temporary files, fsynced, and published
+atomically. It never follows symlinks or accepts paths outside the root.
 Token-expiration retries are bounded. An interrupted run keeps the prior
 baseline, so a fresh inventory can safely plan the remaining work. A new
-baseline is committed only after all actions complete and another pair of fresh
-inventories proves that the trees match.
+baseline is committed while the execution lock is still held, only after all
+actions complete and another pair of fresh inventories proves that the trees
+match.
 
 ## Keep-both conflict resolution engine
 

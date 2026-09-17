@@ -23,6 +23,10 @@ class SyncAction:
     size: int | None = None
     sha1: str | None = None
     expected_local_sha1: str | None = None
+    expected_local_device: int | None = None
+    expected_local_inode: int | None = None
+    local_precondition_path: str | None = None
+    expected_local_subtree: tuple[tuple[object, ...], ...] | None = None
     reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -117,8 +121,9 @@ def build_sync_plan(
             if local_changed or local_moved:
                 actions.append(_conflict(local_path or old_path, old_box, "Box deleted while local changed"))
             else:
-                actions.append(_action("delete_local", old_path, old_box, expected_local_sha1=old_local.sha1,
-                                       reason="post-baseline Box deletion"))
+                action = _action("delete_local", old_path, old_box, expected_local_sha1=old_local.sha1,
+                                 reason="post-baseline Box deletion")
+                actions.append(_bind_local_folder(action, current_local, local, old_path))
             continue
         if current_local.item_type != current_box.item_type:
             actions.append(_conflict(old_path, current_box, "item types differ"))
@@ -130,15 +135,17 @@ def build_sync_plan(
                 if local_path in remote and local_path != old_path:
                     actions.append(_conflict(old_path, current_box, "local rename destination is occupied on Box"))
                 else:
-                    actions.append(_action("move_box", old_path, current_box, destination=local_path,
-                                           reason="unambiguous local rename/move"))
+                    action = _action("move_box", old_path, current_box, destination=local_path,
+                                     reason="unambiguous local rename/move")
+                    actions.append(_bind_local_folder(action, current_local, local, local_path))
             elif box_moved and not local_moved and not local_changed and not box_changed:
                 if box_path in local and box_path != old_path:
                     actions.append(_conflict(old_path, current_box, "Box rename destination is occupied locally"))
                 else:
-                    actions.append(_action("move_local", old_path, current_box, destination=box_path,
-                                           expected_local_sha1=old_local.sha1,
-                                           reason="unambiguous Box rename/move"))
+                    action = _action("move_local", old_path, current_box, destination=box_path,
+                                     expected_local_sha1=old_local.sha1,
+                                     reason="unambiguous Box rename/move")
+                    actions.append(_bind_local_folder(action, current_local, local, old_path))
             else:
                 actions.append(_conflict(old_path, current_box, "ambiguous or simultaneous rename/change"))
             continue
@@ -169,9 +176,10 @@ def build_sync_plan(
             if left.item_type not in SYNCABLE:
                 actions.append(_conflict(path, None, f"unsupported local {left.item_type}"))
             else:
-                actions.append(SyncAction("create_box_folder" if left.item_type == "folder" else "upload_new",
-                                          path, item_type=left.item_type, size=left.size, sha1=left.sha1,
-                                          reason="new local item"))
+                action = SyncAction("create_box_folder" if left.item_type == "folder" else "upload_new",
+                                    path, item_type=left.item_type, size=left.size, sha1=left.sha1,
+                                    reason="new local item")
+                actions.append(_bind_local_folder(action, left, local, path))
         elif right:
             if right.item_type not in SYNCABLE:
                 actions.append(_conflict(path, right, f"unsupported Box {right.item_type}"))
@@ -248,7 +256,51 @@ def _action(action: str, path: str, box: InventoryItem | None, *, destination: s
     return SyncAction(action, path, destination, box.item_type if box else None,
                       box.content_id if box else None, box.version_id if box else None,
                       box.etag if box else None, size if size is not None else (box.size if box else None),
-                      sha1 if sha1 is not None else (box.sha1 if box else None), expected_local_sha1, reason)
+                      sha1 if sha1 is not None else (box.sha1 if box else None), expected_local_sha1,
+                      reason=reason)
+
+
+def _bind_local_folder(
+    action: SyncAction,
+    item: InventoryItem | None,
+    local: dict[str, InventoryItem],
+    path: str | None,
+) -> SyncAction:
+    """Bind a folder action to the inventoried directory and complete subtree."""
+    if item is None or item.item_type != "folder" or path is None:
+        return action
+    data = action.to_dict()
+    data.update(
+        expected_local_device=item.device,
+        expected_local_inode=item.inode,
+        local_precondition_path=path,
+        expected_local_subtree=_inventory_subtree(local, path),
+    )
+    return SyncAction(**data)
+
+
+def _inventory_subtree(
+    local: dict[str, InventoryItem], root: str
+) -> tuple[tuple[object, ...], ...]:
+    prefix = root + "/"
+    entries: list[tuple[object, ...]] = []
+    for path, item in sorted(local.items()):
+        if path != root and not path.startswith(prefix):
+            continue
+        relative = "." if path == root else path[len(prefix):]
+        entries.append(
+            (
+                relative,
+                item.item_type,
+                item.device,
+                item.inode,
+                item.mode,
+                item.mtime_ns,
+                item.size,
+                item.sha1,
+            )
+        )
+    return tuple(entries)
 
 
 def _conflict(path: str, box: InventoryItem | None, reason: str) -> SyncAction:
