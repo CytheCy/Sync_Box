@@ -31,6 +31,13 @@ from sync_box.two_way import (
     build_sync_plan, render_sync_plan, summarize_sync_plan, validate_baseline_match,
 )
 from sync_box.sync_engine import BoxMutations, SyncExecutionError, execute_sync
+from sync_box.systemd_units import (
+    SystemdUnitError,
+    find_invoked_executable,
+    install_user_units,
+    render_user_units,
+    uninstall_user_units,
+)
 
 
 LOGGER = logging.getLogger("sync_box")
@@ -117,11 +124,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         help="display only the first N plan items while retaining full counts",
     )
+
+    systemd_parser = subparsers.add_parser(
+        "systemd", help="install or remove periodic user units without enabling them"
+    )
+    systemd_commands = systemd_parser.add_subparsers(
+        dest="systemd_command", required=True
+    )
+    systemd_commands.add_parser("install", help="install units and reload systemd")
+    systemd_commands.add_parser("uninstall", help="remove generated units and reload systemd")
+    systemd_commands.add_parser("print", help="print units for packaging or review")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "systemd":
+        try:
+            return _handle_systemd(args, find_invoked_executable(sys.argv[0]))
+        except (OSError, SystemdUnitError) as exc:
+            print(f"sync-box: systemd setup error: {exc}", file=sys.stderr)
+            return 1
     try:
         config = load_config(args.config)
     except ConfigError as exc:
@@ -153,18 +176,16 @@ def main(argv: list[str] | None = None) -> int:
             configure_logging(config.log_file if args.save else None)
             return _handle_inventory(args, config)
 
-        configure_logging()
-        if (
-            args.command == "run"
-            and not args.dry_run
-            and not args.initial_download_from_box
-            and load_baseline(config.state_database) is None
-        ):
+        normal_execution = not args.dry_run and not args.initial_download_from_box
+        if normal_execution and load_baseline(config.state_database) is None:
             print(
                 "sync-box: no verified baseline exists; create one before execution",
                 file=sys.stderr,
             )
             return 2
+        configure_logging(config.log_file if normal_execution else None)
+        if normal_execution:
+            LOGGER.info("Starting synchronization run")
         return _handle_run(args, config)
     except (
         AuthenticationError,
@@ -174,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         RuntimeError,
         SyncExecutionError,
     ) as exc:
+        if (
+            args.command == "run"
+            and not args.dry_run
+            and not args.initial_download_from_box
+        ):
+            LOGGER.error("Synchronization run failed: %s", exc)
         if (
             args.command == "run"
             and args.initial_download_from_box
@@ -353,6 +380,27 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
             "Synchronization complete and verified; baseline generation="
             f"{result.new_baseline_generation}"
         )
+        LOGGER.info(
+            "Synchronization complete and verified; baseline generation=%s, actions=%s",
+            result.new_baseline_generation,
+            result.completed,
+        )
+    return 0
+
+
+def _handle_systemd(args: argparse.Namespace, executable: Path) -> int:
+    if args.systemd_command == "install":
+        destination = install_user_units(executable)
+        print(f"Installed disabled user units in {destination}")
+        print("No unit was enabled or started")
+    elif args.systemd_command == "uninstall":
+        destination = uninstall_user_units()
+        print(f"Removed generated user units from {destination}")
+        print("No unit was stopped or disabled")
+    else:
+        for name, contents in render_user_units(executable).items():
+            print(f"### {name}")
+            print(contents, end="")
     return 0
 
 

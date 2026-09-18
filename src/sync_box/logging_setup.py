@@ -29,4 +29,6 @@ def configure_logging(log_file: Path | None = None) -> None:
                 encoding="utf-8",
             )
         )
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, handlers=handlers)
+    logging.basicConfig(
+        level=logging.INFO, format=LOG_FORMAT, handlers=handlers, force=True
+    )

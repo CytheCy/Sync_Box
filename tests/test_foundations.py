@@ -1,4 +1,4 @@
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -227,6 +227,23 @@ class FoundationTests(unittest.TestCase):
         self.assertIn("already_verified_skipped=0", output.getvalue())
         self.assertIn("failed_conflicting=0", output.getvalue())
         self.assertFalse(state_dir.exists())
+
+    def test_unattended_scan_failure_returns_nonzero_and_uses_file_log(self) -> None:
+        config_path = self.tmp_path / "config.toml"
+        state_dir = self.tmp_path / "state"
+        write_config(config_path, state_dir, self.local_root)
+        initialize_database(state_dir / "state.sqlite3")
+
+        with (
+            patch("sync_box.cli.load_baseline", return_value=(1, str(self.local_root), "12345", [])),
+            patch("sync_box.cli.configure_logging") as logging_mock,
+            patch("sync_box.box_auth.build_authenticated_client", side_effect=OSError("network unavailable")),
+            redirect_stderr(StringIO()),
+        ):
+            result = main(["--config", str(config_path), "run", "--summary-only"])
+
+        self.assertEqual(result, 1)
+        logging_mock.assert_called_once_with(state_dir / "sync.log")
 
 
 if __name__ == "__main__":

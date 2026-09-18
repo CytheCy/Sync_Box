@@ -199,6 +199,46 @@ baseline is committed while the execution lock is still held, only after all
 actions complete and another pair of fresh inventories proves that the trees
 match.
 
+## Periodic systemd user timer
+
+Install user units for the current installed `sync-box` executable:
+
+```bash
+sync-box systemd install
+```
+
+This writes `sync-box.service` and `sync-box.timer` below
+`~/.config/systemd/user` (or `$XDG_CONFIG_HOME/systemd/user`) and reloads the
+user manager. It deliberately does not enable or start either unit. The timer
+runs a one-shot synchronization at the half hour and hour, with a stable delay
+of up to two minutes. `Persistent=true` causes one missed invocation to run
+after the user manager resumes or next starts; it does not replay every missed
+interval. The service itself has no automatic restart loop.
+
+When ready to activate periodic synchronization, use:
+
+```bash
+systemctl --user enable --now sync-box.timer
+systemctl --user status sync-box.timer sync-box.service
+journalctl --user-unit sync-box.service
+```
+
+The timer is normally active while the user manager is running. Running it
+without an interactive login across reboot requires user lingering to be
+configured separately. The service sends stdout, stderr, and sanitized
+application messages to the user journal. Executing runs also retain the
+configured rotating application log. The engine's nonblocking local-root and
+database locks remain the authority for preventing concurrent executors;
+systemd additionally will not run two instances of the same one-shot service.
+
+Before removing an enabled installation, disable the timer. Removal itself
+does not stop or disable anything:
+
+```bash
+systemctl --user disable --now sync-box.timer
+sync-box systemd uninstall
+```
+
 ## Keep-both conflict resolution engine
 
 The shared engine exposes structured keep-both planning and execution through
