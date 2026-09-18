@@ -8,11 +8,15 @@ read/write token only for that run.
 
 ## Install on Fedora
 
-The Fedora RPM installs the CLI, Qt tray application, desktop launcher, KDE
-autostart entry, icon, and disabled systemd user units into normal system
-locations. It never packages or removes user configuration, Box credentials,
-the SQLite baseline, logs, or synchronized files. Installing or upgrading the
-RPM does not enable the timer and does not start a synchronization.
+The Fedora RPM installs the CLI, Qt tray application, desktop launcher, optional
+KDE autostart entry, icon, and disabled systemd user units into normal system
+locations. It pulls the Python, PySide6, Box SDK, systemd, and libsecret runtime
+packages from Fedora. It never packages or removes user configuration, Box
+credentials, the SQLite baseline, logs, or synchronized files. Installing or
+upgrading the RPM does not enable the timer and does not start a synchronization.
+
+Open the local RPM in KDE Discover for the normal graphical installation flow,
+or use the single terminal fallback:
 
 Install a built package with Fedora's package manager:
 
@@ -20,27 +24,36 @@ Install a built package with Fedora's package manager:
 sudo dnf install ./sync-box-1.0.0-1.fc44.noarch.rpm
 ```
 
-The official Box CLI 4.6 or newer is also required. Fedora does not currently
-provide that CLI as an RPM, so install it explicitly from its upstream npm
-package after reviewing the Box CLI installation documentation:
+Launch **Sync_Box** from the Plasma application menu. The first-run wizard checks
+the installed resources and runtime, Box CLI, Box authentication, local folder,
+database baseline, and packaged timer. Fedora does not ship the official Box CLI
+as an RPM. When it is missing, the wizard offers to download the matching Linux
+archive from Box's official `box/boxcli` GitHub release, requires the SHA-256
+digest published with that release, and installs only the verified `box` binary
+under `~/.local/share/sync-box/box-cli/`. This is a per-user install and needs no
+root password. The dependency logic is isolated in `sync_box.dependencies`.
 
-```bash
-sudo dnf install nodejs-npm
-sudo npm install --global @box/cli
-box --version
-```
+The Connect button runs Box CLI's Official Box CLI App login and then proves
+access with Sync_Box's existing read-only authentication test. Box CLI remains
+the durable credential owner; Sync_Box keeps only its short-lived downscoped
+token in memory. The wizard then uses a native directory chooser for the local
+mirror (suggesting `~/Box`) and configures Box account root `0` as the complete
+offline mirror.
 
-No installer script downloads the Box CLI or handles its credentials. The
-Fedora `python3-boxsdk` and `python3-pyside6` packages satisfy the application
-runtime dependencies.
+An empty folder is populated through the existing version-pinned, staged,
+no-clobber, SHA-1-verified initial download. A restarted wizard inventories both
+sides again, recognizes already verified files, and safely resumes. A nonempty
+folder is compared read-only. Matching trees may be baselined after another
+fresh verification; differing trees stay in “Setup needs attention” and no
+direction is chosen. The SQLite baseline is created transactionally only after
+fresh inventories match.
 
-Launch **Sync_Box** from the Plasma application menu. The first-run Settings
-dialog accepts an existing local folder and a Box folder URL and creates only
-`~/.config/sync-box/config.toml`. Reconnect Box from Settings to run the
-established official CLI login flow. The GUI does not create a baseline or
-enable unattended synchronization. Before enabling the timer, review the
-pre-baseline comparison and create the baseline with the existing safe CLI
-workflow documented below.
+After those gates pass, an explicit button runs `systemctl --user enable --now
+sync-box.timer` through the systemd controller and verifies the timer is enabled
+and active. The separate tray-at-login checkbox writes only the user's XDG
+autostart preference. Closing the tray does not stop the timer. Expected setup
+failures remain in the GUI, with sanitized details in
+`~/.local/state/sync-box/sync-box.log`.
 
 Build an RPM on Fedora with:
 
@@ -58,8 +71,8 @@ The spec deliberately has no systemd enable/start scriptlet.
 Python 3.11 or newer is required. From this repository:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
+python3 -m venv dev-env
+dev-env/bin/pip install -e .
 ```
 
 This installs the official Box Python SDK v10. The official Box CLI 4.6 or newer
@@ -121,7 +134,7 @@ Authorize with Box's preconfigured official CLI application. No Developer Consol
 application, client secret, or custom redirect URI is needed:
 
 ```bash
-.venv/bin/sync-box auth login
+sync-box auth login
 ```
 
 The command creates and selects a Box CLI environment named `sync-box`, opens the
@@ -132,7 +145,7 @@ files under `~/.box`. For a headless login, add `--code`.
 If authorization later expires, reauthorize the same environment:
 
 ```bash
-.venv/bin/sync-box auth login --reauthorize
+sync-box auth login --reauthorize
 ```
 
 Before each authenticated operation, `sync-box` asks the CLI to exchange its
@@ -144,7 +157,7 @@ memory, and it cannot be refreshed or used to write Box content.
 Test the connection with a read-only current-user request:
 
 ```bash
-.venv/bin/sync-box auth test
+sync-box auth test
 ```
 
 ## Read-only inventories
@@ -152,17 +165,17 @@ Test the connection with a read-only current-user request:
 Scan the local tree without following symbolic links:
 
 ```bash
-.venv/bin/sync-box inventory local
-.venv/bin/sync-box inventory local --summary-only
-.venv/bin/sync-box inventory local --json
+sync-box inventory local
+sync-box inventory local --summary-only
+sync-box inventory local --json
 ```
 
 Scan the configured Box folder recursively with metadata-only API requests:
 
 ```bash
-.venv/bin/sync-box inventory box
-.venv/bin/sync-box inventory box --summary-only
-.venv/bin/sync-box inventory box --json
+sync-box inventory box
+sync-box inventory box --summary-only
+sync-box inventory box --json
 ```
 
 Add `--save` to either inventory command to store the metadata snapshot in the
@@ -183,7 +196,7 @@ but never traversed.
 Initialize a new database or migrate an older database to schema v5:
 
 ```bash
-.venv/bin/sync-box init
+sync-box init
 ```
 
 The migrations preserve existing data and add paired baseline generations, an
@@ -196,7 +209,7 @@ backups.
 Before a baseline exists, compare live local file hashes with Box SHA-1 metadata:
 
 ```bash
-.venv/bin/sync-box run --dry-run --summary-only
+sync-box run --dry-run --summary-only
 ```
 
 The dry run does not save inventories, create logs, or change either tree.
@@ -209,8 +222,8 @@ full review table, or add `--json` for structured review output.
 Once both trees are expected to match, create the baseline:
 
 ```bash
-.venv/bin/sync-box baseline create
-.venv/bin/sync-box baseline status
+sync-box baseline create
+sync-box baseline status
 ```
 
 Creation performs fresh local and Box inventories. It refuses the database
@@ -227,7 +240,7 @@ The dry run never obtains a write-capable token.
 After reviewing a conflict-free plan, execution is explicit:
 
 ```bash
-.venv/bin/sync-box run
+sync-box run
 ```
 
 Execution rejects any plan containing a conflict before changing either tree.
@@ -324,7 +337,7 @@ For an empty or partially downloaded local root, build an explicit initial
 Box-to-local plan and display the first ten actions:
 
 ```bash
-.venv/bin/sync-box run --dry-run --initial-download-from-box --limit 10
+sync-box run --dry-run --initial-download-from-box --limit 10
 ```
 
 This mode counts planned file downloads, files already verified, local folder
@@ -338,7 +351,7 @@ baseline, or write state and log files.
 After reviewing the complete plan, execute that initial population with:
 
 ```bash
-.venv/bin/sync-box run --initial-download-from-box
+sync-box run --initial-download-from-box
 ```
 
 Execution performs a fresh inventory and independently revalidates every reused

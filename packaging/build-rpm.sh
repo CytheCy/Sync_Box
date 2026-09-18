@@ -17,7 +17,7 @@ mkdir -p "$source_dir" "$build_root/BUILD" "$build_root/BUILDROOT" \
 archive="$source_dir/sync-box-$version.tar.gz"
 tar --create --gzip --file "$archive" \
     --transform "s,^,sync-box-$version/," \
-    --exclude='.git' --exclude='.venv' --exclude='build' --exclude='dist' \
+    --exclude='.git' --exclude='.*venv*' --exclude='build' --exclude='dist' \
     --exclude='__pycache__' --exclude='*.pyc' --exclude='src/sync_box.egg-info' \
     -C "$project_root" pyproject.toml README.md config.example.toml packaging src
 

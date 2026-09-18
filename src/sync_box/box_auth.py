@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 from sync_box.box_errors import format_box_api_error, safe_error_detail
 from sync_box.config import AppConfig
+from sync_box.dependencies import user_box_cli_path
 
 
 BOX_CLI_ENVIRONMENT = "sync-box"
@@ -111,7 +112,11 @@ def _access_token(scopes: str, label: str) -> str:
 
 
 def _box_cli_executable() -> str:
-    executable = shutil.which("box")
+    executable = (
+        str(user_box_cli_path())
+        if user_box_cli_path().is_file()
+        else shutil.which("box")
+    )
     if executable is None:
         raise AuthenticationError(
             "The official Box CLI is not installed; install @box/cli 4.6 or newer"

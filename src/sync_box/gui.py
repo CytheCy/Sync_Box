@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
+import os
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QProcess, QTimer, Qt, QUrl
+from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
@@ -19,8 +21,12 @@ from sync_box.app_status import (
     validated_local_folder,
 )
 from sync_box.autostart import autostart_enabled, set_autostart
+from sync_box.box_errors import safe_error_detail
+from sync_box.logging_setup import configure_logging
 from sync_box.resources import cli_command, icon_path
-from sync_box.setup_config import SetupError, create_initial_config
+from sync_box.setup_config import SetupError, create_initial_config, default_state_directory
+from sync_box.requirements import FolderKind, inspect_folder
+from sync_box.setup_controller import InventoryAnalysis, SetupController
 
 
 COLORS = {
@@ -32,6 +38,360 @@ COLORS = {
     StatusKind.NOT_CONFIGURED: "#8b929a",
     StatusKind.AUTH_REQUIRED: "#d6a84b",
 }
+LOGGER = logging.getLogger("sync_box.setup")
+
+
+class _TaskSignals(QObject):
+    finished = Signal(object, object)
+
+
+class _Task(QRunnable):
+    def __init__(self, operation, callback) -> None:
+        super().__init__()
+        self.operation = operation
+        self.signals = _TaskSignals()
+        self.signals.finished.connect(callback)
+
+    def run(self) -> None:
+        try:
+            self.signals.finished.emit(self.operation(), None)
+        except BaseException as exc:
+            self.signals.finished.emit(None, exc)
+
+
+class SetupWizard(QDialog):
+    """Compact first-run flow driven by actual configuration and baseline state."""
+
+    def __init__(self, window: "MainWindow", controller: SetupController | None = None) -> None:
+        super().__init__(window)
+        self.window = window
+        self.controller = controller or SetupController(
+            window.provider.config_path, systemd=window.provider.controller
+        )
+        self.analysis: InventoryAnalysis | None = None
+        self._tasks: list[_Task] = []
+        self.setWindowTitle("Set up Sync_Box")
+        self.setModal(True)
+        self.setMinimumSize(470, 330)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        self.kicker = _section("WELCOME")
+        self.title = QLabel("Sync_Box")
+        self.title.setObjectName("appTitle")
+        self.body = QLabel()
+        self.body.setWordWrap(True)
+        self.detail = QLabel()
+        self.detail.setObjectName("secondary")
+        self.detail.setWordWrap(True)
+        self.path_row = QWidget()
+        path_layout = QHBoxLayout(self.path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        self.path = QLineEdit(str(Path.home() / "Box"))
+        self.choose = QPushButton("Choose…")
+        self.choose.clicked.connect(self._choose_folder)
+        path_layout.addWidget(self.path, 1)
+        path_layout.addWidget(self.choose)
+        self.autostart = QCheckBox("Show Sync_Box in the system tray when I log in")
+        self.autostart.setChecked(autostart_enabled())
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        layout.addWidget(self.kicker)
+        layout.addSpacing(5)
+        layout.addWidget(self.title)
+        layout.addSpacing(8)
+        layout.addWidget(self.body)
+        layout.addWidget(self.detail)
+        layout.addWidget(self.path_row)
+        layout.addWidget(self.autostart)
+        layout.addWidget(self.progress)
+        layout.addStretch()
+        actions = QHBoxLayout()
+        self.logs = QPushButton("Open Logs")
+        self.logs.clicked.connect(window.open_logs)
+        self.logs.hide()
+        self.secondary = QPushButton("Retry")
+        self.secondary.hide()
+        self.primary = QPushButton("Get Started")
+        self.primary.setProperty("primary", True)
+        self.primary.clicked.connect(self._primary_clicked)
+        actions.addWidget(self.logs)
+        actions.addWidget(self.secondary)
+        actions.addStretch()
+        actions.addWidget(self.primary)
+        layout.addLayout(actions)
+        self.stage = "welcome"
+        self._show_welcome()
+
+    def _reset(self) -> None:
+        self.path_row.hide()
+        self.autostart.hide()
+        self.logs.hide()
+        self.secondary.hide()
+        self.detail.clear()
+        self.progress.hide()
+        self.primary.setEnabled(True)
+
+    def _page(self, stage: str, kicker: str, title: str, body: str, button: str) -> None:
+        self.stage = stage
+        self._reset()
+        self.kicker.setText(kicker)
+        self.title.setText(title)
+        self.body.setText(body)
+        self.primary.setText(button)
+
+    def _show_welcome(self) -> None:
+        self._page(
+            "welcome", "WELCOME", "Sync_Box",
+            "Keep a complete local copy of your Box files\nsynchronized automatically.",
+            "Get Started",
+        )
+
+    def _primary_clicked(self) -> None:
+        if self.stage == "welcome":
+            self._resume()
+        elif self.stage == "box":
+            self._busy("Installing and verifying the official Box CLI…")
+            self._run(self.controller.install_box_cli, self._installed)
+        elif self.stage == "auth":
+            self._busy("Waiting for Box authorization…")
+            self._run(lambda: self.controller.authenticate(reauthorize=False), self._authenticated)
+        elif self.stage == "folder":
+            self._save_folder()
+        elif self.stage == "initial":
+            if self.analysis and self.analysis.identical:
+                self._busy("Verifying both sides and establishing the baseline…")
+                self._run(self.controller.establish_identical_baseline, self._baseline_finished)
+            else:
+                self._busy("Downloading and verifying your Box files…")
+                self._run(self.controller.bootstrap_from_box, self._bootstrap_finished)
+        elif self.stage == "automatic":
+            self._busy("Enabling the packaged user timer…")
+            self._run(self.controller.enable_automatic_sync, self._timer_finished)
+        elif self.stage == "ready":
+            try:
+                self.controller.set_gui_autostart(self.autostart.isChecked())
+            except OSError as exc:
+                self._error("Could not save the tray preference", exc)
+                return
+            self.accept()
+            self.window.refresh_status()
+            self.window.show_window()
+
+    def _resume(self) -> None:
+        report = self.controller.requirements.check()
+        missing = []
+        if not report.supported_platform:
+            missing.append("This system is not a supported Fedora/Linux environment.")
+        if not report.package_resources:
+            missing.append("The installed Sync_Box resources are incomplete.")
+        if not report.python_runtime or not report.qt_runtime:
+            missing.append("The packaged Python/Qt runtime is incomplete.")
+        if missing:
+            self._page("requirements", "REQUIREMENTS", "Setup cannot continue", "\n".join(missing), "Retry")
+            self.logs.show()
+            self.stage = "welcome"
+            return
+        if not report.box_cli.usable:
+            self._show_box(report.box_cli.detail)
+            return
+        self._busy("Checking your Box connection…")
+        self._run(self.controller.test_authentication, self._authentication_checked)
+
+    def _show_box(self, detail: str = "Box CLI needs to be installed.") -> None:
+        self._page(
+            "box", "BOX", "BOX ACCOUNT",
+            "Box CLI is required to connect Sync_Box to Box.", "Install Box CLI",
+        )
+        self.detail.setText(detail + "\n\nSource: github.com/box/boxcli (SHA-256 verified, installed for this user).")
+
+    def _show_auth(self, detail: str = "Not connected") -> None:
+        self._page(
+            "auth", "CONNECT", "BOX ACCOUNT",
+            "Connect Sync_Box to your Box account.", "Connect to Box",
+        )
+        self.detail.setText(detail)
+
+    def _show_folder(self) -> None:
+        self._page(
+            "folder", "LOCAL FOLDER", "LOCAL FOLDER",
+            "Choose where your complete offline copy of Box will be stored on this computer.",
+            "Continue",
+        )
+        self.path_row.show()
+        try:
+            config = self.controller.requirements.check().config
+            if config:
+                self.path.setText(str(config.local_root))
+        except Exception:
+            pass
+
+    def _choose_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "Choose local Box folder", self.path.text(), QFileDialog.Option.ShowDirsOnly
+        )
+        if selected:
+            self.path.setText(selected)
+
+    def _save_folder(self) -> None:
+        selected = Path(self.path.text()).expanduser()
+        kind, detail = inspect_folder(selected)
+        create = False
+        if kind is FolderKind.MISSING:
+            create = QMessageBox.question(
+                self, "Create local folder?", f"{selected} does not exist. Create it?"
+            ) == QMessageBox.StandardButton.Yes
+            if not create:
+                return
+        try:
+            self.controller.prepare_local_folder(selected, create=create)
+        except (OSError, SetupError) as exc:
+            self._error("Local folder is not ready", exc)
+            return
+        self._busy("Checking local files and Box…")
+        self._run(self.controller.analyze, self._analyzed)
+
+    def _analyzed(self, result, error) -> None:
+        if error:
+            self._error("Could not compare the local folder and Box", error, retry=self._analyze_again)
+            return
+        self.analysis = result
+        if not result.identical and not result.local_empty:
+            counts = result.differences
+            self._page(
+                "attention", "SETUP NEEDS ATTENTION", "Files differ",
+                "This folder and your Box account contain differences that must be resolved before automatic synchronization can begin.",
+                "Check Again",
+            )
+            self.detail.setText(
+                f"{counts.get('review', 0):,} item(s) need review: "
+                f"{counts.get('local_only', 0):,} local-only, {counts.get('box_only', 0):,} Box-only, "
+                f"{counts.get('content_mismatch', 0):,} content mismatch. No files were changed."
+            )
+            self.primary.clicked.disconnect()
+            self.primary.clicked.connect(self._analyze_again)
+            self.logs.show()
+            return
+        if result.identical:
+            message = (
+                f"Box contains {result.box_files:,} files and {result.box_folders:,} folders.\n\n"
+                "The local folder is identical. Sync_Box will verify both sides again before establishing the baseline."
+            )
+            button = "Establish Baseline"
+        else:
+            message = (
+                f"Box contains {result.box_files:,} files and {result.box_folders:,} folders.\n\n"
+                "The local folder is empty. Sync_Box will download and verify a complete local copy before automatic synchronization begins."
+            )
+            button = "Start Initial Sync"
+        self._page("initial", "INITIAL SETUP", "INITIAL SYNC", message, button)
+
+    def _analyze_again(self) -> None:
+        try:
+            self.primary.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self.primary.clicked.connect(self._primary_clicked)
+        self._busy("Checking local files and Box…")
+        self._run(self.controller.analyze, self._analyzed)
+
+    def _show_automatic(self) -> None:
+        self._page(
+            "automatic", "AUTOMATIC SYNC", "AUTOMATIC SYNC",
+            "Keep these files synchronized automatically every 30 minutes?",
+            "Enable Automatic Sync",
+        )
+
+    def _show_ready(self) -> None:
+        self._page(
+            "ready", "READY", "READY",
+            "✓ Box connected\n✓ Local files verified\n✓ Baseline established\n✓ Automatic sync enabled\n\nSync_Box is ready.",
+            "Finish",
+        )
+        self.autostart.show()
+
+    def _busy(self, text: str) -> None:
+        self.detail.setText(text)
+        self.primary.setEnabled(False)
+        self.progress.show()
+
+    def _run(self, operation, callback) -> None:
+        task = _Task(operation, lambda result, error: self._task_done(task, callback, result, error))
+        self._tasks.append(task)
+        QThreadPool.globalInstance().start(task)
+
+    def _task_done(self, task, callback, result, error) -> None:
+        if task in self._tasks:
+            self._tasks.remove(task)
+        self.progress.hide()
+        self.primary.setEnabled(True)
+        callback(result, error)
+
+    def _installed(self, result, error) -> None:
+        if error:
+            self._error("Box CLI installation failed", error, retry=lambda: self._show_box(str(error)))
+            return
+        self._show_auth("Box CLI installed and verified.")
+
+    def _authentication_checked(self, result, error) -> None:
+        if error:
+            self.window.auth_state = AuthenticationState.REQUIRED
+            self._show_auth("Not connected")
+            return
+        self._authenticated(result, None)
+
+    def _authenticated(self, result, error) -> None:
+        if error:
+            self.window.auth_state = AuthenticationState.REQUIRED
+            self._error("Authentication failed", error, retry=lambda: self._show_auth("Authentication failed. Try again."))
+            return
+        _user_id, name = result
+        self.window.auth_state = AuthenticationState.CONNECTED
+        self.window.account = name
+        report = self.controller.requirements.check()
+        if report.config is None or report.folder_kind not in {FolderKind.EMPTY, FolderKind.NONEMPTY}:
+            self._show_folder()
+        elif report.database.has_baseline:
+            if report.systemd.timer_enabled and report.systemd.timer.running:
+                self._show_ready()
+            else:
+                self._show_automatic()
+        else:
+            self._busy("Checking local files and Box…")
+            self._run(self.controller.analyze, self._analyzed)
+
+    def _baseline_finished(self, _result, error) -> None:
+        if error:
+            self._error("The baseline was not established", error, retry=self._analyze_again)
+            return
+        self._show_automatic()
+
+    def _bootstrap_finished(self, _result, error) -> None:
+        if error:
+            self._error("Initial download was interrupted", error, retry=self._analyze_again)
+            return
+        self._show_automatic()
+
+    def _timer_finished(self, result, error) -> None:
+        if error or not result[0]:
+            self._error("Automatic sync could not be enabled", error or RuntimeError(result[1]), retry=self._show_automatic)
+            return
+        self._show_ready()
+
+    def _error(self, title: str, error: BaseException, retry=None) -> None:
+        detail = safe_error_detail(error)
+        LOGGER.error("%s: %s", title, detail)
+        self.progress.hide()
+        self.primary.setEnabled(True)
+        self.detail.setText(f"{title}.\n{detail}")
+        self.logs.show()
+        if retry:
+            self.secondary.show()
+            try:
+                self.secondary.clicked.disconnect()
+            except RuntimeError:
+                pass
+            self.secondary.clicked.connect(retry)
 
 
 class SettingsDialog(QDialog):
@@ -152,6 +512,7 @@ class MainWindow(QMainWindow):
         self._request_refreshes = 0
         self._quitting = False
         self.auth_process: QProcess | None = None
+        self.setup_wizard: SetupWizard | None = None
         self.snapshot = self.provider.read()
         self.setWindowTitle("Sync_Box")
         self.setWindowIcon(QIcon(str(icon_path())))
@@ -163,7 +524,29 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.refresh_status)
         self.poll_timer.start(3000)
-        QTimer.singleShot(100, self.check_authentication)
+        QTimer.singleShot(100, self._start_application)
+
+    def _start_application(self) -> None:
+        report = SetupController(
+            self.provider.config_path, systemd=self.provider.controller
+        ).requirements.check()
+        setup_complete = (
+            report.config is not None
+            and report.database.has_baseline
+            and report.systemd.timer_enabled
+            and report.systemd.timer.running
+        )
+        if setup_complete:
+            self.check_authentication()
+            return
+        self.hide()
+        self.setup_wizard = SetupWizard(self)
+        self.setup_wizard.finished.connect(self._setup_closed)
+        self.setup_wizard.show()
+
+    def _setup_closed(self) -> None:
+        if self.setup_wizard and self.setup_wizard.result() == QDialog.DialogCode.Accepted:
+            self.show_window()
 
     def _build_window(self) -> None:
         central = QWidget()
@@ -347,10 +730,8 @@ class MainWindow(QMainWindow):
 
     def open_logs(self) -> None:
         config = self.snapshot.config
-        if config is None:
-            QMessageBox.information(self, "Logs unavailable", "Sync_Box is not configured yet.")
-            return
-        path = config.log_file if config.log_file.exists() else config.log_file.parent
+        log_file = config.log_file if config else default_state_directory() / "sync-box.log"
+        path = log_file if log_file.exists() else log_file.parent
         if not path.exists():
             QMessageBox.information(self, "Logs unavailable", "No log has been created yet.")
             return
@@ -453,6 +834,13 @@ def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("Sync_Box")
     application.setDesktopFileName("sync-box")
+    if os.geteuid() == 0:
+        QMessageBox.critical(
+            None, "Sync_Box cannot run as root",
+            "Launch Sync_Box as your normal desktop user so its configuration and files remain user-owned.",
+        )
+        return 1
+    configure_logging(default_state_directory() / "sync-box.log")
     application.setQuitOnLastWindowClosed(False)
     application.setStyle("Fusion")
     application.setStyleSheet(STYLESHEET)

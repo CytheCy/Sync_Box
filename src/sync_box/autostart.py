@@ -20,7 +20,7 @@ def user_autostart_path() -> Path:
 def autostart_enabled(path: Path | None = None) -> bool:
     override = path or user_autostart_path()
     if not override.exists():
-        return True  # The RPM installs a system-wide XDG autostart entry.
+        return False
     try:
         return "Hidden=true" not in override.read_text(encoding="utf-8")
     except OSError:

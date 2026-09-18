@@ -41,8 +41,9 @@ def default_state_directory() -> Path:
 
 def create_initial_config(
     local_root: Path,
-    box_folder_url: str,
+    box_folder_url: str | None = None,
     *,
+    box_folder_id: str = "0",
     config_path: Path | None = None,
     state_directory: Path | None = None,
 ) -> Path:
@@ -58,7 +59,9 @@ def create_initial_config(
     root = expanded_root.resolve(strict=False)
     if not root.is_dir():
         raise SetupError("The local folder must already exist.")
-    folder_id = box_folder_id_from_url(box_folder_url)
+    folder_id = box_folder_id_from_url(box_folder_url) if box_folder_url else box_folder_id
+    if not folder_id.isdigit():
+        raise SetupError("The Box folder identifier must contain only digits.")
     state = (state_directory or default_state_directory()).expanduser().resolve(strict=False)
     if state.is_relative_to(root):
         raise SetupError("Application state must be outside the synchronized folder.")

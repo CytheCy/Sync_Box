@@ -17,16 +17,19 @@ BuildRequires:  libappstream-glib
 Requires:       python3dist(boxsdk) >= 10
 Requires:       python3dist(boxsdk) < 11
 Requires:       python3dist(pyside6) >= 6.6
+Requires:       python3 >= 3.11
 Requires:       systemd
-Recommends:     nodejs-npm
+Requires:       libsecret
+Requires:       kf6-kwallet
 
 %description
 Sync_Box safely synchronizes a local folder with Box using a verified SQLite
 baseline. This package includes the command-line interface, a PySide6 system
 tray application, and disabled-by-default user service and timer units.
 
-The official Box CLI 4.6 or newer must be installed separately because Fedora
-does not currently ship it as an RPM. Sync_Box never stores OAuth credentials.
+On first launch, Sync_Box can install a SHA-256-verified Linux build of the
+official Box CLI from Box's GitHub releases into the current user's data
+directory. Sync_Box never stores OAuth credentials.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -73,4 +76,5 @@ appstream-util validate-relax --nonet packaging/io.github.sync_box.SyncBox.metai
 
 %changelog
 * Fri Sep 18 2026 Sync_Box Maintainers <noreply@example.invalid> - 1.0.0-1
+- Add a resumable native first-run setup and verified official Box CLI installer
 - Add the native Qt tray application and Fedora user-service packaging
