@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Sync_Box approximately every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+Persistent=true
+RandomizedDelaySec=2m
+FixedRandomDelay=true
+AccuracySec=1m
+Unit=sync-box.service
+
+[Install]
+WantedBy=timers.target

@@ -159,7 +159,7 @@ def _sdk_components() -> tuple[Any, Any]:
         from box_sdk_gen import BoxClient, BoxDeveloperTokenAuth
     except ImportError as exc:
         raise AuthenticationError(
-            "The Box SDK is not installed; install the project with "
-            "'.venv/bin/pip install -e .'"
+            "The Box SDK is not installed; install the Python boxsdk dependency "
+            "for this application."
         ) from exc
     return BoxClient, BoxDeveloperTokenAuth

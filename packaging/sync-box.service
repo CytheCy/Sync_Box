@@ -1,0 +1,13 @@
+[Unit]
+Description=Synchronize the configured local folder with Box
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sync-box run --summary-only
+Restart=no
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sync-box
+TimeoutStartSec=infinity
+TimeoutStopSec=30s

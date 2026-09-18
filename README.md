@@ -8,6 +8,53 @@ read/write token only for that run.
 
 ## Install on Fedora
 
+The Fedora RPM installs the CLI, Qt tray application, desktop launcher, KDE
+autostart entry, icon, and disabled systemd user units into normal system
+locations. It never packages or removes user configuration, Box credentials,
+the SQLite baseline, logs, or synchronized files. Installing or upgrading the
+RPM does not enable the timer and does not start a synchronization.
+
+Install a built package with Fedora's package manager:
+
+```bash
+sudo dnf install ./sync-box-1.0.0-1.fc44.noarch.rpm
+```
+
+The official Box CLI 4.6 or newer is also required. Fedora does not currently
+provide that CLI as an RPM, so install it explicitly from its upstream npm
+package after reviewing the Box CLI installation documentation:
+
+```bash
+sudo dnf install nodejs-npm
+sudo npm install --global @box/cli
+box --version
+```
+
+No installer script downloads the Box CLI or handles its credentials. The
+Fedora `python3-boxsdk` and `python3-pyside6` packages satisfy the application
+runtime dependencies.
+
+Launch **Sync_Box** from the Plasma application menu. The first-run Settings
+dialog accepts an existing local folder and a Box folder URL and creates only
+`~/.config/sync-box/config.toml`. Reconnect Box from Settings to run the
+established official CLI login flow. The GUI does not create a baseline or
+enable unattended synchronization. Before enabling the timer, review the
+pre-baseline comparison and create the baseline with the existing safe CLI
+workflow documented below.
+
+Build an RPM on Fedora with:
+
+```bash
+sudo dnf install rpm-build dnf-plugins-core
+sudo dnf builddep ./packaging/sync-box.spec
+./packaging/build-rpm.sh
+```
+
+Artifacts are written below `build/rpmbuild/RPMS/` and `build/rpmbuild/SRPMS/`.
+The spec deliberately has no systemd enable/start scriptlet.
+
+## Development install
+
 Python 3.11 or newer is required. From this repository:
 
 ```bash
@@ -200,6 +247,21 @@ actions complete and another pair of fresh inventories proves that the trees
 match.
 
 ## Periodic systemd user timer
+
+The RPM installs equivalent static units at
+`/usr/lib/systemd/user/sync-box.service` and
+`/usr/lib/systemd/user/sync-box.timer`. The service runs
+`/usr/bin/sync-box run --summary-only`. Enable it only after authentication,
+configuration, and a verified baseline are ready:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now sync-box.timer
+```
+
+Closing or quitting the tray application does not stop or disable this timer.
+The tray application's login startup is controlled separately through the
+Freedesktop autostart entry and its Settings checkbox.
 
 Install user units for the current installed `sync-box` executable:
 

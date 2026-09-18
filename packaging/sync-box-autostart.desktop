@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sync_Box Tray
+Comment=Show Sync_Box synchronization status in the system tray
+Exec=/usr/bin/sync-box-gui
+Icon=sync-box
+Terminal=false
+OnlyShowIn=KDE;
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+StartupNotify=false

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.sync_box.SyncBox</id>
+  <name>Sync_Box</name>
+  <summary>Conservative two-way synchronization with Box</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-Not-Provided</project_license>
+  <description>
+    <p>Sync_Box provides a compact system tray interface for a systemd-managed,
+    baseline-verified synchronization service.</p>
+  </description>
+  <url type="homepage">https://github.com/CytheCy/Sync_Box</url>
+  <developer id="io.github.cythecy"><name>Sync_Box Maintainers</name></developer>
+  <content_rating type="oars-1.1"/>
+  <launchable type="desktop-id">sync-box.desktop</launchable>
+  <provides><binary>sync-box-gui</binary></provides>
+  <releases><release version="1.0.0" date="2026-09-18"/></releases>
+</component>
