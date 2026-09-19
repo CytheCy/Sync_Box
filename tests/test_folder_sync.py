@@ -204,6 +204,20 @@ class FolderExecutorTests(unittest.TestCase):
         self.execute_plan(self.plan(self.baseline_local, remote), FakeBox(), remote)
         self.assertTrue((self.root / "remote").is_dir())
 
+    def test_folder_preflight_accepts_hyphen_prefixed_child(self) -> None:
+        folder = self.root / "folder"
+        folder.mkdir()
+        (folder / "-child").write_bytes(b"x")
+        local_now = scan_local(self.root, hash_files=True)
+        fake = FakeBox()
+
+        self.execute_plan(
+            self.plan(local_now, self.baseline_box), fake, self.baseline_box
+        )
+
+        self.assertEqual(fake.calls[0][0:3], ("mkdir", "0", "folder"))
+        self.assertEqual(fake.calls[1][0:3], ("upload", "101", "-child"))
+
     def test_empty_and_nonempty_folder_deletion_both_directions(self) -> None:
         # Empty Box deletion and local deletion execution.
         folder = self.root / "empty"

@@ -300,7 +300,7 @@ def _inventory_subtree(
                 item.sha1,
             )
         )
-    return tuple(entries)
+    return tuple(sorted(entries, key=lambda entry: str(entry[0])))
 
 
 def _conflict(path: str, box: InventoryItem | None, reason: str) -> SyncAction:
