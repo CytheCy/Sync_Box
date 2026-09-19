@@ -635,6 +635,7 @@ class MainWindow(QMainWindow):
         self.quit_action.triggered.connect(self.quit_gui)
         self.tray.activated.connect(self._tray_activated)
         self.tray.setContextMenu(self.tray_menu)
+        self.tray.setIcon(self.windowIcon())
         self.tray.show()
 
     def refresh_status(self) -> None:

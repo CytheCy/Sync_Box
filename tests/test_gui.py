@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 try:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 except ImportError:
     raise unittest.SkipTest("PySide6 is not installed in this interpreter")
 
@@ -61,6 +61,19 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertFalse(window.isVisible())
         self.assertFalse(window._quitting)
         window.tray.hide()
+        window.deleteLater()
+
+    def test_tray_has_icon_before_becoming_visible(self) -> None:
+        icons_at_show = []
+
+        class RecordingTray(QSystemTrayIcon):
+            def show(self):
+                icons_at_show.append(self.icon().isNull())
+
+        with patch("sync_box.gui.QSystemTrayIcon", RecordingTray):
+            window, _provider = self.make_window()
+
+        self.assertEqual(icons_at_show, [False])
         window.deleteLater()
 
     def test_quit_does_not_disable_timer(self) -> None:
