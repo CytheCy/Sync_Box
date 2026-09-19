@@ -21,7 +21,7 @@ or use the single terminal fallback:
 Install a built package with Fedora's package manager:
 
 ```bash
-sudo dnf install ./sync-box-1.0.0-1.fc44.noarch.rpm
+sudo dnf install ./sync-box-1.0.1-1.fc44.noarch.rpm
 ```
 
 Launch **Sync_Box** from the Plasma application menu. The first-run wizard checks

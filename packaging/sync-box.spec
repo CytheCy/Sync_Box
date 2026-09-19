@@ -1,5 +1,5 @@
 Name:           sync-box
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Conservative two-way synchronization between a local folder and Box
 License:        LicenseRef-Not-Provided
@@ -75,6 +75,9 @@ appstream-util validate-relax --nonet packaging/io.github.sync_box.SyncBox.metai
 %{_userunitdir}/sync-box.timer
 
 %changelog
+* Fri Sep 18 2026 Sync_Box Maintainers <noreply@example.invalid> - 1.0.1-1
+- Fix false folder-change failures for punctuation-prefixed child names
+
 * Fri Sep 18 2026 Sync_Box Maintainers <noreply@example.invalid> - 1.0.0-1
 - Add a resumable native first-run setup and verified official Box CLI installer
 - Add the native Qt tray application and Fedora user-service packaging
