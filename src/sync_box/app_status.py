@@ -37,6 +37,12 @@ class AuthenticationState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ConflictDetail:
+    relative_path: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class UnitState:
     load_state: str = "not-found"
     active_state: str = "inactive"
@@ -73,6 +79,7 @@ class DatabaseState:
     latest_outcome: str | None = None
     latest_summary: str | None = None
     conflict: bool = False
+    conflicts: tuple[ConflictDetail, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,13 +309,18 @@ def read_database_state(path: Path) -> DatabaseState:
     except (sqlite3.Error, OSError):
         return DatabaseState()
 
-    plan_conflict = False
+    plan_conflicts: tuple[ConflictDetail, ...] = ()
     if latest and latest[3]:
         try:
-            plan_conflict = any(
-                item.get("action") == "conflict" for item in json.loads(latest[3])
+            plan_conflicts = tuple(
+                ConflictDetail(
+                    relative_path=str(item.get("relative_path", "Unknown path")),
+                    reason=str(item.get("reason", "Conflict requires attention")),
+                )
+                for item in json.loads(latest[3])
+                if isinstance(item, dict) and item.get("action") == "conflict"
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, json.JSONDecodeError):
             pass
     return DatabaseState(
         has_baseline=baseline is not None,
@@ -316,7 +328,8 @@ def read_database_state(path: Path) -> DatabaseState:
         last_completed=_parse_sqlite_datetime(completed[0] if completed else None),
         latest_outcome=str(latest[1]) if latest and latest[1] else None,
         latest_summary=str(latest[2]) if latest and latest[2] else None,
-        conflict=bool(resolution or unresolved or plan_conflict),
+        conflict=bool(resolution or unresolved or plan_conflicts),
+        conflicts=plan_conflicts,
     )
 
 

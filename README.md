@@ -235,6 +235,8 @@ With a baseline, `run --dry-run` prints exact upload, download, delete, move,
 and conflict actions. Box IDs track remote moves; local device/inode identity is
 used only as a conservative move hint. Concurrent edits, occupied destinations,
 replaced Box identities, unsupported items, and ambiguities become conflicts.
+Names that differ only by letter case also become conflicts because Box treats
+file names case-insensitively even on case-sensitive local filesystems.
 The dry run never obtains a write-capable token.
 
 After reviewing a conflict-free plan, execution is explicit:

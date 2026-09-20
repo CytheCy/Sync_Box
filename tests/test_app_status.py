@@ -1,5 +1,6 @@
 from pathlib import Path
 from contextlib import closing
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -130,6 +131,28 @@ class StatusProviderTests(unittest.TestCase):
                 "VALUES ('file.txt', CURRENT_TIMESTAMP, 'both changed')"
             )
         self.assertEqual(self.provider().read().kind, StatusKind.CONFLICT)
+
+    def test_planned_conflict_exposes_path_and_reason(self) -> None:
+        write_config(self.config, self.local, self.database)
+        self.establish_baseline()
+        plan = [{
+            "action": "conflict",
+            "relative_path": "photos/aaa.jpeg",
+            "reason": "local name differs only by case from an existing Box item",
+        }]
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO sync_runs(started_at, finished_at, dry_run, outcome, "
+                "summary, plan_json) VALUES (CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+                "0, 'failed', 'conflicts=1', ?)",
+                (json.dumps(plan),),
+            )
+
+        status = self.provider().read()
+
+        self.assertEqual(status.kind, StatusKind.CONFLICT)
+        self.assertEqual(status.database.conflicts[0].relative_path, "photos/aaa.jpeg")
+        self.assertIn("differs only by case", status.database.conflicts[0].reason)
 
     def test_local_folder_validation(self) -> None:
         write_config(self.config, self.local, self.database)

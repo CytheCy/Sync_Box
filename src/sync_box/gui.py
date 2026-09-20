@@ -5,19 +5,21 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import stat
 import sys
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QProgressBar,
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from sync_box.app_status import (
-    AuthenticationState, StatusKind, StatusProvider, StatusSnapshot,
+    AuthenticationState, ConflictDetail, StatusKind, StatusProvider, StatusSnapshot,
     validated_local_folder,
 )
 from sync_box.autostart import autostart_enabled, set_autostart
@@ -28,6 +30,7 @@ from sync_box.resources import cli_command, icon_path
 from sync_box.setup_config import SetupError, create_initial_config, default_state_directory
 from sync_box.requirements import FolderKind, inspect_folder
 from sync_box.setup_controller import InventoryAnalysis, SetupController
+from sync_box.sync_engine import _fsync_directory, _rename_noreplace
 
 
 COLORS = {
@@ -40,6 +43,9 @@ COLORS = {
     StatusKind.AUTH_REQUIRED: "#d6a84b",
 }
 LOGGER = logging.getLogger("sync_box.setup")
+LOCAL_CASE_CONFLICT_REASON = (
+    "local name differs only by case from an existing Box item"
+)
 
 
 class _TaskSignals(QObject):
@@ -503,6 +509,137 @@ class SettingsDialog(QDialog):
             QTimer.singleShot(0, self.window.check_authentication)
 
 
+class ConflictDialog(QDialog):
+    """Show detected conflicts and apply safe local-name corrections."""
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self.window = window
+        self.conflicts = window.snapshot.database.conflicts
+        self.setWindowTitle("Resolve sync conflict")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(10)
+
+        layout.addWidget(_section("SYNC CONFLICT"))
+        title = QLabel("Choose how to correct the local name")
+        title.setObjectName("appTitle")
+        layout.addWidget(title)
+        self.paths = QComboBox()
+        for conflict in self.conflicts:
+            self.paths.addItem(conflict.relative_path)
+        self.paths.currentIndexChanged.connect(self._selection_changed)
+        layout.addWidget(self.paths)
+        self.reason = QLabel()
+        self.reason.setWordWrap(True)
+        self.reason.setObjectName("secondary")
+        layout.addWidget(self.reason)
+        self.explanation = QLabel()
+        self.explanation.setWordWrap(True)
+        layout.addWidget(self.explanation)
+
+        actions = QHBoxLayout()
+        self.open_button = QPushButton("Open Folder")
+        self.custom_button = QPushButton("Choose Name…")
+        self.suggested_button = QPushButton("Keep Both")
+        self.suggested_button.setProperty("primary", True)
+        close_button = QPushButton("Cancel")
+        self.open_button.clicked.connect(self._open_parent)
+        self.custom_button.clicked.connect(self._choose_name)
+        self.suggested_button.clicked.connect(self._use_suggested_name)
+        close_button.clicked.connect(self.reject)
+        actions.addWidget(self.open_button)
+        actions.addStretch()
+        actions.addWidget(close_button)
+        actions.addWidget(self.custom_button)
+        actions.addWidget(self.suggested_button)
+        layout.addLayout(actions)
+        self._selection_changed()
+
+    def _selected(self) -> ConflictDetail | None:
+        index = self.paths.currentIndex()
+        return self.conflicts[index] if 0 <= index < len(self.conflicts) else None
+
+    def _selection_changed(self, _index: int = -1) -> None:
+        conflict = self._selected()
+        if conflict is None:
+            self.reason.setText("No conflict details are available.")
+            self.explanation.clear()
+            self.custom_button.setEnabled(False)
+            self.suggested_button.setEnabled(False)
+            return
+        self.reason.setText(conflict.reason)
+        supported = conflict.reason == LOCAL_CASE_CONFLICT_REASON
+        if supported:
+            suggestion = _suggested_conflict_name(
+                self.window.snapshot.local_folder, conflict.relative_path
+            )
+            self.explanation.setText(
+                "Box ignores letter case in file names. Keep Both renames the "
+                f"local file to {suggestion!r}; Choose Name lets you enter another name."
+            )
+        else:
+            self.explanation.setText(
+                "This conflict cannot be corrected automatically. Open its folder "
+                "to review the files."
+            )
+        self.custom_button.setEnabled(supported)
+        self.suggested_button.setEnabled(supported)
+
+    def _open_parent(self) -> None:
+        conflict = self._selected()
+        root = self.window.snapshot.local_folder
+        if conflict is None or root is None:
+            return
+        parent = root.joinpath(*PurePosixPath(conflict.relative_path).parts).parent
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(parent)))
+
+    def _use_suggested_name(self) -> None:
+        conflict = self._selected()
+        root = self.window.snapshot.local_folder
+        if conflict is None or root is None:
+            return
+        name = _suggested_conflict_name(root, conflict.relative_path)
+        answer = QMessageBox.question(
+            self,
+            "Keep both files?",
+            f"Rename the local file to {name!r}?\n\nBoth files will then sync to Box.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._apply_name(conflict, name)
+
+    def _choose_name(self) -> None:
+        conflict = self._selected()
+        root = self.window.snapshot.local_folder
+        if conflict is None or root is None:
+            return
+        suggested = _suggested_conflict_name(root, conflict.relative_path)
+        name, accepted = QInputDialog.getText(
+            self, "Choose a local name", "New file name:", text=suggested
+        )
+        if accepted:
+            self._apply_name(conflict, name)
+
+    def _apply_name(self, conflict: ConflictDetail, name: str) -> None:
+        root = self.window.snapshot.local_folder
+        if root is None:
+            return
+        try:
+            destination = _rename_conflict_file(root, conflict.relative_path, name)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "File was not renamed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Conflict corrected",
+            f"Renamed the local file to {destination.name!r}. Synchronization will run now.",
+        )
+        self.accept()
+        self.window.refresh_status()
+        self.window.sync_now()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, provider: StatusProvider | None = None) -> None:
         super().__init__()
@@ -517,8 +654,8 @@ class MainWindow(QMainWindow):
         self.snapshot = self.provider.read()
         self.setWindowTitle("Sync_Box")
         self.setWindowIcon(QIcon(str(icon_path())))
-        self.resize(500, 400)
-        self.setMinimumSize(470, 370)
+        self.resize(540, 520)
+        self.setMinimumSize(500, 460)
         self._build_window()
         self._build_tray()
         self.refresh_status()
@@ -583,6 +720,29 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.setMaximumHeight(5)
         layout.addWidget(self.progress)
+        layout.addSpacing(8)
+
+        self.conflict_panel = QWidget()
+        conflict_layout = QVBoxLayout(self.conflict_panel)
+        conflict_layout.setContentsMargins(0, 0, 0, 0)
+        conflict_layout.setSpacing(6)
+        conflict_layout.addWidget(_section("CONFLICT"))
+        self.conflict_path = QLabel()
+        self.conflict_path.setWordWrap(True)
+        self.conflict_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.conflict_reason = QLabel()
+        self.conflict_reason.setObjectName("secondary")
+        self.conflict_reason.setWordWrap(True)
+        conflict_actions = QHBoxLayout()
+        self.resolve_button = QPushButton("Resolve Conflict…")
+        self.resolve_button.setProperty("primary", True)
+        self.resolve_button.clicked.connect(self.open_conflicts)
+        conflict_actions.addWidget(self.resolve_button)
+        conflict_actions.addStretch()
+        conflict_layout.addWidget(self.conflict_path)
+        conflict_layout.addWidget(self.conflict_reason)
+        conflict_layout.addLayout(conflict_actions)
+        layout.addWidget(self.conflict_panel)
         layout.addSpacing(8)
 
         layout.addWidget(_section("LOCAL FOLDER"))
@@ -663,6 +823,18 @@ class MainWindow(QMainWindow):
         self.next_sync.setText(_next_sync_text(snapshot))
         self.progress.setVisible(snapshot.kind is StatusKind.SYNCING)
         self.progress.setRange(0, 0 if snapshot.kind is StatusKind.SYNCING else 100)
+        conflicts = snapshot.database.conflicts
+        self.conflict_panel.setVisible(snapshot.kind is StatusKind.CONFLICT)
+        if conflicts:
+            first = conflicts[0]
+            suffix = f" (+{len(conflicts) - 1} more)" if len(conflicts) > 1 else ""
+            self.conflict_path.setText(first.relative_path + suffix)
+            self.conflict_reason.setText(first.reason)
+            self.resolve_button.setEnabled(True)
+        else:
+            self.conflict_path.setText("Conflict details are unavailable.")
+            self.conflict_reason.clear()
+            self.resolve_button.setEnabled(False)
         self.folder.setText(str(snapshot.local_folder) if snapshot.local_folder else "Not selected")
         count = snapshot.database.item_count
         self.items.setText(f"{count:,} items" if snapshot.database.has_baseline else "No verified baseline")
@@ -742,6 +914,10 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         SettingsDialog(self).exec()
 
+    def open_conflicts(self) -> None:
+        if self.snapshot.database.conflicts:
+            ConflictDialog(self).exec()
+
     def show_window(self) -> None:
         self.showNormal()
         self.raise_()
@@ -768,6 +944,59 @@ def _section(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("section")
     return label
+
+
+def _suggested_conflict_name(root: Path | None, relative_path: str) -> str:
+    original = PurePosixPath(relative_path).name
+    path = PurePosixPath(original)
+    suffix = path.suffix if not original.startswith(".") else ""
+    stem = original[:-len(suffix)] if suffix else original
+    parent = (
+        root.joinpath(*PurePosixPath(relative_path).parts).parent
+        if root is not None
+        else None
+    )
+    occupied = {
+        entry.name.casefold() for entry in os.scandir(parent)
+    } if parent is not None and parent.is_dir() else set()
+    for number in range(1, 10_000):
+        marker = " (local copy)" if number == 1 else f" (local copy {number})"
+        candidate = f"{stem}{marker}{suffix}"
+        if candidate.casefold() not in occupied:
+            return candidate
+    raise ValueError("Could not find an available conflict-copy name")
+
+
+def _rename_conflict_file(root: Path, relative_path: str, new_name: str) -> Path:
+    if (
+        not new_name
+        or new_name in {".", ".."}
+        or "/" in new_name
+        or "\x00" in new_name
+        or len(new_name.encode("utf-8")) > 255
+    ):
+        raise ValueError("Enter one valid file name of at most 255 bytes.")
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or relative.name == "":
+        raise ValueError("The conflict path is unsafe.")
+    resolved_root = root.resolve(strict=True)
+    source = resolved_root.joinpath(*relative.parts)
+    parent = source.parent.resolve(strict=True)
+    if parent != resolved_root and resolved_root not in parent.parents:
+        raise ValueError("The conflict path leaves the synchronized folder.")
+    value = source.lstat()
+    if not stat.S_ISREG(value.st_mode) or source.is_symlink():
+        raise ValueError("The conflicted item is not a regular local file.")
+    occupied = {
+        entry.name.casefold() for entry in os.scandir(parent)
+        if entry.name != source.name
+    }
+    if new_name.casefold() in occupied or new_name == source.name:
+        raise ValueError("That name is already in use in this folder.")
+    destination = parent / new_name
+    _rename_noreplace(source, destination)
+    _fsync_directory(parent)
+    return destination
 
 
 def _format_time(value: datetime | None) -> str:

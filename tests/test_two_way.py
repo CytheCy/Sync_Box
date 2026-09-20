@@ -51,6 +51,18 @@ class PlannerTests(unittest.TestCase):
                                   [ROOT_PAIR[1], box("remote.txt", item_id="20")])
         self.assertEqual({a.action for a in actions}, {"upload_new", "download_new"})
 
+    def test_box_case_insensitive_name_collision_is_a_conflict(self) -> None:
+        actions = build_sync_plan(
+            [ROOT_PAIR],
+            [ROOT_PAIR[0], local("AAA.jpeg"), local("aaa.jpeg", b"different")],
+            [ROOT_PAIR[1], box("AAA.jpeg")],
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].action, "conflict")
+        self.assertEqual(actions[0].relative_path, "aaa.jpeg")
+        self.assertIn("differs only by case", actions[0].reason)
+
     def test_one_sided_modifications(self) -> None:
         self.assertEqual(self.plan(local("a"), box("a"), local("a", b"two"), box("a"))[0].action,
                          "upload_version")
@@ -162,13 +174,17 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(source.tell(), 0)
         self.assertEqual(uploads.upload_file.call_args.kwargs["content_md_5"], digest)
 
-    def test_conflict_preflight_makes_no_changes(self) -> None:
+    def test_conflict_preflight_journals_without_content_changes(self) -> None:
         action = self._conflict()
         with self.assertRaisesRegex(SyncExecutionError, "conflict"):
             execute_sync(FakeBox(), self.root, self.db, [action],
                          baseline_generation=self.generation, box_items_by_path={})
         with closing(sqlite3.connect(self.db)) as connection:
-            self.assertEqual(connection.execute("SELECT count(*) FROM sync_runs").fetchone()[0], 0)
+            run = connection.execute(
+                "SELECT outcome, summary, plan_json FROM sync_runs"
+            ).fetchone()
+        self.assertEqual(run[0:2], ("failed", "conflicts=1"))
+        self.assertIn('"action": "conflict"', run[2])
 
     def _conflict(self):
         return self._action("conflict", "a")
@@ -220,6 +236,81 @@ class ExecutorTests(unittest.TestCase):
             execute_sync(Broken(), self.root, self.db, [action],
                          baseline_generation=self.generation, box_items_by_path={})
         self.assertNotIn("secret", str(raised.exception))
+
+    def test_identical_upload_name_conflict_is_reconciled_into_baseline(self) -> None:
+        content = b"already uploaded"
+        (self.root / "photo.jpg").write_bytes(content)
+        action = self._action(
+            "upload_new", "photo.jpg", size=len(content), sha1=sha(content)
+        )
+
+        class AlreadyUploaded(FakeBox):
+            def upload_new(self, *args):
+                error = RuntimeError("name conflict")
+                error.response_info = SimpleNamespace(  # type: ignore[attr-defined]
+                    status_code=409,
+                    code="item_name_in_use",
+                    context_info={
+                        "conflicts": [{
+                            "type": "file",
+                            "id": "42",
+                            "name": "photo.jpg",
+                            "sha1": sha(content),
+                            "etag": "1",
+                            "file_version": {"id": "3"},
+                        }]
+                    },
+                )
+                raise error
+
+        local_now = [ROOT_PAIR[0], local("photo.jpg", content)]
+        result = execute_sync(
+            AlreadyUploaded(),
+            self.root,
+            self.db,
+            [action],
+            baseline_generation=self.generation,
+            box_items_by_path={".": ROOT_PAIR[1]},
+            verify_inventories=lambda: (local_now, [ROOT_PAIR[1]]),
+        )
+
+        self.assertEqual(result.completed, 1)
+        baseline = load_baseline(self.db)
+        self.assertEqual(baseline[0], result.new_baseline_generation)
+        self.assertEqual(baseline[3][1][1].content_id, "42")
+
+    def test_different_upload_name_conflict_remains_an_error(self) -> None:
+        content = b"local"
+        (self.root / "photo.jpg").write_bytes(content)
+        action = self._action(
+            "upload_new", "photo.jpg", size=len(content), sha1=sha(content)
+        )
+
+        class DifferentRemote(FakeBox):
+            def upload_new(self, *args):
+                error = RuntimeError("name conflict")
+                error.response_info = SimpleNamespace(  # type: ignore[attr-defined]
+                    status_code=409,
+                    code="item_name_in_use",
+                    context_info={
+                        "conflicts": [{
+                            "type": "file",
+                            "id": "42",
+                            "name": "photo.jpg",
+                            "sha1": sha(b"different"),
+                        }]
+                    },
+                    body={"message": "Item with the same name already exists"},
+                    request_id="safe",
+                )
+                raise error
+
+        with self.assertRaisesRegex(SyncExecutionError, "item_name_in_use"):
+            execute_sync(
+                DifferentRemote(), self.root, self.db, [action],
+                baseline_generation=self.generation,
+                box_items_by_path={".": ROOT_PAIR[1]},
+            )
 
     def test_expired_download_token_refreshes_once(self) -> None:
         content = b"fresh"

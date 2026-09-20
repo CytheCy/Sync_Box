@@ -12,10 +12,15 @@ except ImportError:
     raise unittest.SkipTest("PySide6 is not installed in this interpreter")
 
 from sync_box.app_status import (
-    AuthenticationState, DatabaseState, StatusKind, StatusSnapshot,
+    AuthenticationState, ConflictDetail, DatabaseState, StatusKind, StatusSnapshot,
     SystemdState, UnitState,
 )
-from sync_box.gui import MainWindow, SettingsDialog
+from sync_box.gui import (
+    MainWindow,
+    SettingsDialog,
+    _rename_conflict_file,
+    _suggested_conflict_name,
+)
 
 
 class FakeProvider:
@@ -99,6 +104,45 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertFalse(dialog.timer.isEnabled())
         dialog.deleteLater()
         window.deleteLater()
+
+    def test_conflict_card_shows_path_reason_and_resolution(self) -> None:
+        window, provider = self.make_window()
+        conflict = ConflictDetail(
+            "photos/aaa.jpeg",
+            "local name differs only by case from an existing Box item",
+        )
+        provider.snapshot = StatusSnapshot(
+            StatusKind.CONFLICT,
+            "Conflict",
+            "A conflict requires attention.",
+            None,
+            SystemdState(UnitState(), UnitState()),
+            DatabaseState(conflict=True, conflicts=(conflict,)),
+        )
+
+        window.refresh_status()
+
+        self.assertFalse(window.conflict_panel.isHidden())
+        self.assertIn("photos/aaa.jpeg", window.conflict_path.text())
+        self.assertIn("differs only by case", window.conflict_reason.text())
+        self.assertTrue(window.resolve_button.isEnabled())
+        window.deleteLater()
+
+    def test_conflict_rename_preserves_file_with_box_compatible_name(self) -> None:
+        root = Path(self.temporary.name) / "rename-root"
+        root.mkdir(exist_ok=True)
+        folder = root / "photos"
+        folder.mkdir(exist_ok=True)
+        source = folder / "aaa.jpeg"
+        source.write_bytes(b"local content")
+        (folder / "AAA.jpeg").write_bytes(b"box content")
+
+        suggestion = _suggested_conflict_name(root, "photos/aaa.jpeg")
+        destination = _rename_conflict_file(root, "photos/aaa.jpeg", suggestion)
+
+        self.assertEqual(destination.name, "aaa (local copy).jpeg")
+        self.assertEqual(destination.read_bytes(), b"local content")
+        self.assertFalse(source.exists())
 
 
 if __name__ == "__main__":

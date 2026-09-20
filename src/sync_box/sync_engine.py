@@ -17,7 +17,11 @@ from collections.abc import Callable
 from typing import Any
 from types import SimpleNamespace
 
-from sync_box.box_errors import format_box_api_error, is_expired_content_token_error
+from sync_box.box_errors import (
+    format_box_api_error,
+    is_expired_content_token_error,
+    matching_upload_conflict,
+)
 from sync_box.database import (
     begin_sync_run,
     finish_sync_run,
@@ -108,11 +112,6 @@ def execute_sync(
                 "Synchronization refused: conflict resolution "
                 f"{incomplete['id']} is incomplete"
             )
-        conflicts = [item for item in plan if item.action == "conflict"]
-        if conflicts:
-            raise SyncExecutionError(
-                f"Synchronization refused: {len(conflicts)} conflict(s) require review"
-            )
         if revalidate_plan is not None:
             refreshed_plan = revalidate_plan()
             if [item.to_dict() for item in refreshed_plan] != [
@@ -128,14 +127,24 @@ def execute_sync(
             baseline_generation=baseline_generation,
             local_root=str(root),
         )
+        conflicts = [item for item in plan if item.action == "conflict"]
+        if conflicts:
+            finish_sync_run(
+                state_database, run_id, "failed", f"conflicts={len(conflicts)}"
+            )
+            raise SyncExecutionError(
+                f"Synchronization refused: {len(conflicts)} conflict(s) require review"
+            )
         completed = 0
         current_box = box
+        reconciled_box_items: dict[str, InventoryItem] = {}
         try:
             _verify_folder_preconditions(root, plan)
             for action in plan:
                 try:
                     current_box = _execute_one(current_box, root, action, box_items_by_path,
-                                               refresh_box=refresh_box)
+                                               refresh_box=refresh_box,
+                                               reconciled_box_items=reconciled_box_items)
                 except Exception as exc:
                     mark_operation(state_database, run_id, action.relative_path, action.action,
                                    "failed", str(exc))
@@ -145,6 +154,9 @@ def execute_sync(
             new_generation = None
             if verify_inventories is not None:
                 verified_local, verified_box = verify_inventories()
+                verified_box = _include_reconciled_box_items(
+                    verified_box, reconciled_box_items
+                )
                 validate_baseline_match(verified_local, verified_box)
                 new_generation = replace_baseline(
                     state_database,
@@ -165,7 +177,8 @@ def execute_sync(
 
 
 def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
-                 box_items: dict[str, Any], *, refresh_box: Callable[[], BoxMutations] | None) -> BoxMutations:
+                 box_items: dict[str, Any], *, refresh_box: Callable[[], BoxMutations] | None,
+                 reconciled_box_items: dict[str, InventoryItem] | None = None) -> BoxMutations:
     path = _path(root, action.relative_path)
     if action.action in {"upload_new", "upload_version"}:
         _safe_parent(root, path.parent, action.relative_path)
@@ -178,7 +191,27 @@ def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
                     box.upload_version(_required(action.box_item_id), path.name, source,
                                        action.box_etag, action.sha1 or "")
             except Exception as exc:
-                if refresh_box and is_expired_content_token_error(exc):
+                conflict = (
+                    matching_upload_conflict(
+                        exc, name=path.name, sha1=action.sha1 or ""
+                    )
+                    if action.action == "upload_new" and action.sha1
+                    else None
+                )
+                if conflict is not None:
+                    item = InventoryItem(
+                        action.relative_path,
+                        "file",
+                        size=conflict.size if conflict.size is not None else action.size,
+                        content_id=conflict.content_id,
+                        version_id=conflict.version_id,
+                        etag=conflict.etag,
+                        sha1=conflict.sha1,
+                    )
+                    box_items[action.relative_path] = item
+                    if reconciled_box_items is not None:
+                        reconciled_box_items[action.relative_path] = item
+                elif refresh_box and is_expired_content_token_error(exc):
                     box = _refresh_safely(refresh_box, action.relative_path)
                     source.seek(0)
                     try:
@@ -272,6 +305,18 @@ def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
     else:
         raise SyncExecutionError(f"Unsupported sync action: {action.action}")
     return box
+
+
+def _include_reconciled_box_items(
+    verified: list[InventoryItem], reconciled: dict[str, InventoryItem]
+) -> list[InventoryItem]:
+    """Fill listing gaps using identical files proven by Box's 409 response."""
+    if not reconciled:
+        return verified
+    by_path = {item.relative_path: item for item in verified}
+    for path, item in reconciled.items():
+        by_path.setdefault(path, item)
+    return sorted(by_path.values(), key=lambda item: item.relative_path)
 
 
 def _download_atomic(box: BoxMutations, root: Path, action: SyncAction, *, replace: bool) -> None:

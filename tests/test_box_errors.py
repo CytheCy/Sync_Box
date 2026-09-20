@@ -1,10 +1,41 @@
 from types import SimpleNamespace
 import unittest
 
-from sync_box.box_errors import format_box_api_error, safe_error_detail
+from sync_box.box_errors import (
+    format_box_api_error,
+    matching_upload_conflict,
+    safe_error_detail,
+)
 
 
 class BoxErrorTests(unittest.TestCase):
+    def test_matching_upload_conflict_requires_same_file_and_sha1(self) -> None:
+        error = RuntimeError("conflict")
+        error.response_info = SimpleNamespace(  # type: ignore[attr-defined]
+            status_code=409,
+            code="item_name_in_use",
+            context_info={
+                "conflicts": {
+                    "type": "file",
+                    "id": "42",
+                    "name": "photo.jpg",
+                    "sha1": "ABC123",
+                    "etag": "7",
+                    "file_version": {"id": "9"},
+                }
+            },
+        )
+
+        conflict = matching_upload_conflict(
+            error, name="photo.jpg", sha1="abc123"
+        )
+
+        self.assertIsNotNone(conflict)
+        self.assertEqual((conflict.content_id, conflict.version_id), ("42", "9"))
+        self.assertIsNone(
+            matching_upload_conflict(error, name="photo.jpg", sha1="different")
+        )
+
     def test_api_error_reports_only_selected_response_fields(self) -> None:
         error = RuntimeError("request included Authorization: Bearer secret-value")
         error.response_info = SimpleNamespace(  # type: ignore[attr-defined]

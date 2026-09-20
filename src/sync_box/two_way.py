@@ -166,6 +166,8 @@ def build_sync_plan(
 
     new_local = {p: i for p, i in local.items() if p != "." and p not in claimed_local and p not in base}
     new_box = {p: i for p, i in remote.items() if p != "." and p not in claimed_box and p not in base_box_ids.values()}
+    local_casefold = _casefold_paths(local)
+    box_casefold = _casefold_paths(remote)
     for path in sorted(set(new_local) | set(new_box)):
         left, right = new_local.get(path), new_box.get(path)
         if left and right:
@@ -173,7 +175,14 @@ def build_sync_plan(
                 continue
             actions.append(_conflict(path, right, "different new items occupy the same path"))
         elif left:
-            if left.item_type not in SYNCABLE:
+            case_collision = _different_case_item(path, box_casefold)
+            if case_collision is not None:
+                actions.append(_conflict(
+                    path,
+                    case_collision,
+                    "local name differs only by case from an existing Box item",
+                ))
+            elif left.item_type not in SYNCABLE:
                 actions.append(_conflict(path, None, f"unsupported local {left.item_type}"))
             else:
                 action = SyncAction("create_box_folder" if left.item_type == "folder" else "upload_new",
@@ -181,7 +190,17 @@ def build_sync_plan(
                                     reason="new local item")
                 actions.append(_bind_local_folder(action, left, local, path))
         elif right:
-            if right.item_type not in SYNCABLE:
+            case_collision = _different_case_item(path, local_casefold)
+            if case_collision is not None and case_collision.relative_path in new_local:
+                # The local-side path already emitted the one conflict for this pair.
+                continue
+            if case_collision is not None:
+                actions.append(_conflict(
+                    path,
+                    right,
+                    "Box name differs only by case from an existing local item",
+                ))
+            elif right.item_type not in SYNCABLE:
                 actions.append(_conflict(path, right, f"unsupported Box {right.item_type}"))
             else:
                 actions.append(_action("create_local_folder" if right.item_type == "folder" else "download_new",
@@ -226,6 +245,25 @@ def _unique(items: list[InventoryItem], label: str) -> dict[str, InventoryItem]:
     if len(result) != len(items):
         raise ScanError(f"Duplicate path in {label} inventory")
     return result
+
+
+def _casefold_paths(
+    items: dict[str, InventoryItem]
+) -> dict[str, list[InventoryItem]]:
+    result: dict[str, list[InventoryItem]] = {}
+    for path, item in items.items():
+        result.setdefault(path.casefold(), []).append(item)
+    return result
+
+
+def _different_case_item(
+    path: str, folded: dict[str, list[InventoryItem]]
+) -> InventoryItem | None:
+    candidates = [
+        item for item in folded.get(path.casefold(), [])
+        if item.relative_path != path
+    ]
+    return sorted(candidates, key=lambda item: item.relative_path)[0] if candidates else None
 
 
 def _same_content(left: InventoryItem, right: InventoryItem) -> bool:
