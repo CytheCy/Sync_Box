@@ -6,6 +6,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import traceback
+
+from sync_box.box_errors import safe_error_detail
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -32,3 +35,22 @@ def configure_logging(log_file: Path | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO, format=LOG_FORMAT, handlers=handlers, force=True
     )
+
+
+def log_failure(
+    logger: logging.Logger, message: str, error: BaseException
+) -> None:
+    """Log a useful traceback without exposing chained exception details."""
+    frames = traceback.extract_tb(error.__traceback__)
+    locations = "\n".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
+        for frame in frames
+    )
+    summary = (
+        f"{message}: {type(error).__name__}: "
+        f"{safe_error_detail(error)}"
+    )
+    if locations:
+        logger.error("%s\nTraceback (most recent call last):\n%s", summary, locations)
+    else:
+        logger.error("%s", summary)

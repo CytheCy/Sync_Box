@@ -12,13 +12,14 @@ from sync_box.box_auth import (
     authorize,
     test_authentication,
 )
+from sync_box.box_errors import safe_error_detail
 from sync_box.box_inventory import scan_box
 from sync_box.config import AppConfig, ConfigError, default_config_path, load_config
 from sync_box.database import initialize_database, load_baseline, replace_baseline, save_inventory
 from sync_box.inventory import ScanError, render_inventory, summarize
 from sync_box.initial_download import InitialDownloadError, execute_initial_download
 from sync_box.local_inventory import scan_local
-from sync_box.logging_setup import configure_logging
+from sync_box.logging_setup import configure_logging, log_failure
 from sync_box.planner import (
     build_comparison_plan,
     build_initial_download_plan,
@@ -145,12 +146,18 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, SystemdUnitError) as exc:
             print(f"sync-box: systemd setup error: {exc}", file=sys.stderr)
             return 1
+    file_logging_enabled = False
     try:
         config = load_config(args.config)
     except ConfigError as exc:
         print(f"sync-box: configuration error: {exc}", file=sys.stderr)
         return 2
 
+    failure_message = {
+        "init": "Initialization failed",
+        "inventory": "Inventory scan failed",
+        "run": "Synchronization run failed",
+    }.get(args.command, "Sync_Box operation failed")
     try:
         if args.command == "check-config":
             configure_logging()
@@ -159,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "init":
             configure_logging(config.log_file)
+            file_logging_enabled = True
             initialize_database(config.state_database)
             LOGGER.info("State database is ready at %s", config.state_database)
             return 0
@@ -174,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "inventory":
             configure_logging(config.log_file if args.save else None)
+            file_logging_enabled = args.save
             return _handle_inventory(args, config)
 
         normal_execution = not args.dry_run and not args.initial_download_from_box
@@ -184,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         configure_logging(config.log_file if normal_execution else None)
+        file_logging_enabled = normal_execution
         if normal_execution:
             LOGGER.info("Starting synchronization run")
         return _handle_run(args, config)
@@ -195,12 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         RuntimeError,
         SyncExecutionError,
     ) as exc:
-        if (
-            args.command == "run"
-            and not args.dry_run
-            and not args.initial_download_from_box
-        ):
-            LOGGER.error("Synchronization run failed: %s", exc)
+        if file_logging_enabled:
+            log_failure(LOGGER, failure_message, exc)
         if (
             args.command == "run"
             and args.initial_download_from_box
@@ -216,7 +222,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"{getattr(result, 'failed_conflicting', 1)}",
                 file=sys.stderr,
             )
-        print(f"sync-box: {exc}", file=sys.stderr)
+        print(f"sync-box: {safe_error_detail(exc)}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        if file_logging_enabled:
+            log_failure(LOGGER, "Unexpected Sync_Box failure", exc)
+        print(
+            f"sync-box: unexpected error: {safe_error_detail(exc)}",
+            file=sys.stderr,
+        )
         return 1
 
 

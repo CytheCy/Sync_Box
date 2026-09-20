@@ -236,14 +236,38 @@ class FoundationTests(unittest.TestCase):
 
         with (
             patch("sync_box.cli.load_baseline", return_value=(1, str(self.local_root), "12345", [])),
-            patch("sync_box.cli.configure_logging") as logging_mock,
             patch("sync_box.box_auth.build_authenticated_client", side_effect=OSError("network unavailable")),
             redirect_stderr(StringIO()),
         ):
             result = main(["--config", str(config_path), "run", "--summary-only"])
 
         self.assertEqual(result, 1)
-        logging_mock.assert_called_once_with(state_dir / "sync.log")
+        log_text = (state_dir / "sync.log").read_text(encoding="utf-8")
+        self.assertIn("Synchronization run failed: OSError: network unavailable", log_text)
+        self.assertIn("Traceback (most recent call last):", log_text)
+        self.assertIn("in _handle_run", log_text)
+
+    def test_unexpected_run_failure_is_logged_and_redacted(self) -> None:
+        config_path = self.tmp_path / "config.toml"
+        state_dir = self.tmp_path / "state"
+        write_config(config_path, state_dir, self.local_root)
+        initialize_database(state_dir / "state.sqlite3")
+
+        with (
+            patch("sync_box.cli.load_baseline", return_value=(1, str(self.local_root), "12345", [])),
+            patch(
+                "sync_box.cli._handle_run",
+                side_effect=ValueError("access_token=do-not-log-this"),
+            ),
+            redirect_stderr(StringIO()),
+        ):
+            result = main(["--config", str(config_path), "run", "--summary-only"])
+
+        self.assertEqual(result, 1)
+        log_text = (state_dir / "sync.log").read_text(encoding="utf-8")
+        self.assertIn("Unexpected Sync_Box failure: ValueError", log_text)
+        self.assertIn("access_token=[REDACTED]", log_text)
+        self.assertNotIn("do-not-log-this", log_text)
 
 
 if __name__ == "__main__":

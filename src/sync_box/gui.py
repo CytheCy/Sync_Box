@@ -22,7 +22,8 @@ from sync_box.app_status import (
 )
 from sync_box.autostart import autostart_enabled, set_autostart
 from sync_box.box_errors import safe_error_detail
-from sync_box.logging_setup import configure_logging
+from sync_box.config import ConfigError, default_config_path, load_config
+from sync_box.logging_setup import configure_logging, log_failure
 from sync_box.resources import cli_command, icon_path
 from sync_box.setup_config import SetupError, create_initial_config, default_state_directory
 from sync_box.requirements import FolderKind, inspect_folder
@@ -380,7 +381,7 @@ class SetupWizard(QDialog):
 
     def _error(self, title: str, error: BaseException, retry=None) -> None:
         detail = safe_error_detail(error)
-        LOGGER.error("%s: %s", title, detail)
+        log_failure(LOGGER, title, error)
         self.progress.hide()
         self.primary.setEnabled(True)
         self.detail.setText(f"{title}.\n{detail}")
@@ -841,7 +842,18 @@ def main() -> int:
             "Launch Sync_Box as your normal desktop user so its configuration and files remain user-owned.",
         )
         return 1
-    configure_logging(default_state_directory() / "sync-box.log")
+    log_file = default_state_directory() / "sync-box.log"
+    config_error = None
+    try:
+        log_file = load_config(default_config_path()).log_file
+    except ConfigError as exc:
+        config_error = exc
+    configure_logging(log_file)
+    if config_error is not None:
+        log_failure(LOGGER, "Could not load the configured log location", config_error)
+    sys.excepthook = lambda _kind, error, _traceback: log_failure(
+        LOGGER, "Unhandled GUI failure", error
+    )
     application.setQuitOnLastWindowClosed(False)
     application.setStyle("Fusion")
     application.setStyleSheet(STYLESHEET)
