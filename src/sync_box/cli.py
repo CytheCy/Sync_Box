@@ -6,6 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+from time import monotonic
 
 from sync_box.box_auth import (
     AuthenticationError,
@@ -15,7 +16,15 @@ from sync_box.box_auth import (
 from sync_box.box_errors import safe_error_detail
 from sync_box.box_inventory import scan_box
 from sync_box.config import AppConfig, ConfigError, default_config_path, load_config
-from sync_box.database import initialize_database, load_baseline, replace_baseline, save_inventory
+from sync_box.database import (
+    begin_sync_progress,
+    clear_sync_progress,
+    initialize_database,
+    load_baseline,
+    replace_baseline,
+    save_inventory,
+    update_sync_progress,
+)
 from sync_box.inventory import ScanError, render_inventory, summarize
 from sync_box.initial_download import InitialDownloadError, execute_initial_download
 from sync_box.local_inventory import scan_local
@@ -196,7 +205,13 @@ def main(argv: list[str] | None = None) -> int:
         file_logging_enabled = normal_execution
         if normal_execution:
             LOGGER.info("Starting synchronization run")
-        return _handle_run(args, config)
+        if normal_execution:
+            begin_sync_progress(config.state_database, "Scanning local files")
+        try:
+            return _handle_run(args, config)
+        finally:
+            if normal_execution:
+                clear_sync_progress(config.state_database)
     except (
         AuthenticationError,
         InitialDownloadError,
@@ -278,15 +293,64 @@ def _handle_inventory(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
-def _fresh_inventories(config: AppConfig, client: object) -> tuple[list[object], list[object]]:
-    local_items = scan_local(
-        config.local_root, hash_files=True,
-        excluded_paths=config.excluded_paths, excluded_names=config.excluded_names,
-    )
-    box_items = scan_box(
-        client, config.box_folder_id,
-        excluded_paths=config.excluded_paths, excluded_names=config.excluded_names,
-    )
+class _ProgressReporter:
+    """Throttle durable scan updates so inventory work remains the bottleneck."""
+
+    def __init__(self, database: Path, estimated_total: int) -> None:
+        self.database = database
+        self.estimated_total = estimated_total
+        self.phase_name = ""
+        self.last_write = 0.0
+
+    def phase(self, name: str, *, total: int | None = None) -> None:
+        self.phase_name = name
+        self.last_write = monotonic()
+        update_sync_progress(
+            self.database,
+            name,
+            0,
+            self.estimated_total if total is None else total,
+        )
+
+    def report(self, completed: int, *, force: bool = False) -> None:
+        now = monotonic()
+        if not force and now - self.last_write < 0.5:
+            return
+        total = max(self.estimated_total, completed)
+        update_sync_progress(self.database, self.phase_name, completed, total)
+        self.last_write = now
+
+
+def _fresh_inventories(
+    config: AppConfig,
+    client: object,
+    progress: _ProgressReporter | None = None,
+    *,
+    local_phase: str = "Scanning local files",
+    box_phase: str = "Reading Box inventory",
+) -> tuple[list[object], list[object]]:
+    local_arguments = {
+        "hash_files": True,
+        "excluded_paths": config.excluded_paths,
+        "excluded_names": config.excluded_names,
+    }
+    if progress is not None:
+        progress.phase(local_phase)
+        local_arguments["progress"] = progress.report
+    local_items = scan_local(config.local_root, **local_arguments)
+    if progress is not None:
+        progress.report(len(local_items), force=True)
+
+    box_arguments = {
+        "excluded_paths": config.excluded_paths,
+        "excluded_names": config.excluded_names,
+    }
+    if progress is not None:
+        progress.phase(box_phase)
+        box_arguments["progress"] = progress.report
+    box_items = scan_box(client, config.box_folder_id, **box_arguments)
+    if progress is not None:
+        progress.report(len(box_items), force=True)
     return local_items, box_items
 
 
@@ -314,7 +378,16 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     from sync_box.box_auth import build_authenticated_client
 
     client = build_authenticated_client(config)
-    local_items, box_items = _fresh_inventories(config, client)
+    baseline_hint = load_baseline(config.state_database)
+    progress = (
+        _ProgressReporter(
+            config.state_database,
+            len(baseline_hint[3]) if baseline_hint is not None else 0,
+        )
+        if not args.dry_run and not args.initial_download_from_box
+        else None
+    )
+    local_items, box_items = _fresh_inventories(config, client, progress)
     if args.initial_download_from_box:
         plan = build_initial_download_plan(local_items, box_items)
         counts = summarize_initial_download(plan)
@@ -376,18 +449,34 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     if not args.dry_run:
         from sync_box.box_auth import build_write_authenticated_client
         write_client = build_write_authenticated_client(config)
+        if progress is not None:
+            progress.phase("Applying changes", total=len(plan))
+
+        def revalidate():
+            fresh_local, fresh_box = _fresh_inventories(
+                config,
+                build_authenticated_client(config),
+                progress,
+                local_phase="Rechecking local files",
+                box_phase="Rechecking Box inventory",
+            )
+            if progress is not None:
+                progress.phase("Applying changes", total=len(plan))
+            return build_sync_plan(pairs, fresh_local, fresh_box)
+
         result = execute_sync(
             BoxMutations(write_client, config.box_folder_id), config.local_root,
             config.state_database, plan,
             baseline_generation=generation,
             box_items_by_path={item.relative_path: item for item in box_items},
             refresh_box=lambda: BoxMutations(build_write_authenticated_client(config), config.box_folder_id),
-            revalidate_plan=lambda: build_sync_plan(
-                pairs,
-                *_fresh_inventories(config, build_authenticated_client(config)),
-            ),
+            revalidate_plan=revalidate,
             verify_inventories=lambda: _fresh_inventories(
-                config, build_authenticated_client(config)
+                config,
+                build_authenticated_client(config),
+                progress,
+                local_phase="Verifying local files",
+                box_phase="Verifying Box inventory",
             ),
         )
         print(

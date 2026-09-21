@@ -64,7 +64,7 @@ class FoundationTests(unittest.TestCase):
 
         with closing(sqlite3.connect(database_path)) as connection:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 5
+                connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
             for table in (
                 "item_baselines",
@@ -74,6 +74,7 @@ class FoundationTests(unittest.TestCase):
                 "inventory_items",
                 "conflict_resolution_runs",
                 "conflict_resolution_operations",
+                "sync_progress",
             ):
                 count = connection.execute(
                     f"SELECT count(*) FROM {table}"

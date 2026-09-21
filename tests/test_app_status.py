@@ -122,6 +122,47 @@ class StatusProviderTests(unittest.TestCase):
         self.assertEqual(status.database.item_count, 1)
         self.assertEqual(status.account, "person@example.com")
 
+    def test_running_status_reports_operation_progress(self) -> None:
+        write_config(self.config, self.local, self.database)
+        self.establish_baseline()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            run_id = connection.execute(
+                "INSERT INTO sync_runs(started_at, dry_run, outcome) "
+                "VALUES (CURRENT_TIMESTAMP, 0, 'running')"
+            ).lastrowid
+            connection.executemany(
+                "INSERT INTO sync_operations(run_id, relative_path, action, status, step_order) "
+                "VALUES (?, ?, 'upload_new', ?, ?)",
+                [
+                    (run_id, "one", "completed", 1),
+                    (run_id, "two", "pending", 2),
+                ],
+            )
+        self.controller.snapshot.return_value = system_state(running=True)
+
+        status = self.provider().read()
+
+        self.assertEqual(status.database.operation_completed, 1)
+        self.assertEqual(status.database.operation_total, 2)
+        self.assertIn("1 of 2 operations", status.detail)
+
+    def test_running_status_reports_inventory_progress(self) -> None:
+        write_config(self.config, self.local, self.database)
+        self.establish_baseline()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO sync_progress(singleton, phase, completed, total) "
+                "VALUES (1, 'Scanning local files', 37, 100)"
+            )
+        self.controller.snapshot.return_value = system_state(running=True)
+
+        status = self.provider().read()
+
+        self.assertEqual(status.database.progress_phase, "Scanning local files")
+        self.assertEqual(status.database.progress_completed, 37)
+        self.assertEqual(status.database.progress_total, 100)
+        self.assertEqual(status.detail, "Scanning local files (37 of 100 items).")
+
     def test_unresolved_conflict_is_presented(self) -> None:
         write_config(self.config, self.local, self.database)
         self.establish_baseline()

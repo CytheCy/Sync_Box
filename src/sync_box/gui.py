@@ -822,7 +822,20 @@ class MainWindow(QMainWindow):
         self.last_sync.setText(f"Last sync: {_format_time(snapshot.database.last_completed)}")
         self.next_sync.setText(_next_sync_text(snapshot))
         self.progress.setVisible(snapshot.kind is StatusKind.SYNCING)
-        self.progress.setRange(0, 0 if snapshot.kind is StatusKind.SYNCING else 100)
+        database = snapshot.database
+        scanning = (
+            database.progress_phase
+            and database.progress_phase != "Applying changes"
+            and database.progress_total
+        )
+        if snapshot.kind is StatusKind.SYNCING and scanning:
+            self.progress.setRange(0, database.progress_total)
+            self.progress.setValue(database.progress_completed)
+        elif snapshot.kind is StatusKind.SYNCING and database.operation_total:
+            self.progress.setRange(0, database.operation_total)
+            self.progress.setValue(database.operation_completed)
+        else:
+            self.progress.setRange(0, 0 if snapshot.kind is StatusKind.SYNCING else 100)
         conflicts = snapshot.database.conflicts
         self.conflict_panel.setVisible(snapshot.kind is StatusKind.CONFLICT)
         if conflicts:

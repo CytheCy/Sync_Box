@@ -13,13 +13,14 @@ from typing import Any, Iterable
 from sync_box.inventory import InventoryItem
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MIGRATIONS = {
     1: "schema.sql",
     2: "migrations/0002_inventory.sql",
     3: "migrations/0003_sync_state.sql",
     4: "migrations/0004_conflict_resolution.sql",
     5: "migrations/0005_sync_run_guard.sql",
+    6: "migrations/0006_sync_progress.sql",
 }
 
 
@@ -43,6 +44,40 @@ def initialize_database(path: Path) -> None:
             for version in range(current_version + 1, SCHEMA_VERSION + 1):
                 resource = files("sync_box").joinpath(*MIGRATIONS[version].split("/"))
                 connection.executescript(resource.read_text(encoding="utf-8"))
+
+
+def begin_sync_progress(path: Path, phase: str, total: int | None = None) -> None:
+    """Create the process-independent progress record read by the GUI."""
+    initialize_database(path)
+    update_sync_progress(path, phase, 0, total)
+
+
+def update_sync_progress(
+    path: Path,
+    phase: str,
+    completed: int,
+    total: int | None = None,
+) -> None:
+    if completed < 0 or (total is not None and total < 0):
+        raise ValueError("Sync progress counts cannot be negative")
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute(
+                "INSERT INTO sync_progress(singleton, phase, completed, total, updated_at) "
+                "VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(singleton) DO UPDATE SET "
+                "phase=excluded.phase, completed=excluded.completed, "
+                "total=excluded.total, updated_at=excluded.updated_at",
+                (phase, completed, total),
+            )
+
+
+def clear_sync_progress(path: Path) -> None:
+    if not path.is_file():
+        return
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("DELETE FROM sync_progress WHERE singleton=1")
 
 
 def save_inventory(

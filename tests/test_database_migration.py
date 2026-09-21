@@ -39,7 +39,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
-            self.assertEqual(version, 5)
+            self.assertEqual(version, 6)
             self.assertEqual(baseline, "kept.txt")
             self.assertIn("inventory_items", tables)
 
@@ -101,7 +101,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 indexes = {
                     row[1] for row in connection.execute("PRAGMA index_list(sync_runs)")
                 }
-            self.assertEqual(version, 5)
+            self.assertEqual(version, 6)
             self.assertTrue({"baseline_generation", "local_root", "plan_json"} <= columns)
             self.assertEqual(preserved, ("before-v5", "completed"))
             self.assertEqual(stale_outcomes, [("failed",)])

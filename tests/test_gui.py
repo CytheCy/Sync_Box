@@ -144,6 +144,46 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), b"local content")
         self.assertFalse(source.exists())
 
+    def test_sync_progress_shows_completed_operations(self) -> None:
+        window, provider = self.make_window()
+        provider.snapshot = StatusSnapshot(
+            StatusKind.SYNCING,
+            "Syncing",
+            "Synchronization is in progress (4 of 10 operations).",
+            None,
+            SystemdState(UnitState(active_state="active"), UnitState()),
+            DatabaseState(operation_total=10, operation_completed=4),
+        )
+
+        window.refresh_status()
+
+        self.assertEqual(window.progress.maximum(), 10)
+        self.assertEqual(window.progress.value(), 4)
+        self.assertIn("4 of 10 operations", window.main_status.text())
+        window.deleteLater()
+
+    def test_sync_progress_shows_inventory_items(self) -> None:
+        window, provider = self.make_window()
+        provider.snapshot = StatusSnapshot(
+            StatusKind.SYNCING,
+            "Syncing",
+            "Verifying local files (25 of 80 items).",
+            None,
+            SystemdState(UnitState(active_state="active"), UnitState()),
+            DatabaseState(
+                progress_phase="Verifying local files",
+                progress_total=80,
+                progress_completed=25,
+            ),
+        )
+
+        window.refresh_status()
+
+        self.assertEqual(window.progress.maximum(), 80)
+        self.assertEqual(window.progress.value(), 25)
+        self.assertIn("25 of 80 items", window.main_status.text())
+        window.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

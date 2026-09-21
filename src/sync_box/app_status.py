@@ -80,6 +80,11 @@ class DatabaseState:
     latest_summary: str | None = None
     conflict: bool = False
     conflicts: tuple[ConflictDetail, ...] = ()
+    operation_total: int = 0
+    operation_completed: int = 0
+    progress_phase: str | None = None
+    progress_total: int = 0
+    progress_completed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,8 +225,33 @@ class StatusProvider:
 
         database = read_database_state(config.state_database)
         if systemd.service.running or requested:
+            if database.progress_phase and database.progress_phase != "Applying changes":
+                if database.progress_total:
+                    detail = (
+                        f"{database.progress_phase} "
+                        f"({database.progress_completed:,} of "
+                        f"{database.progress_total:,} items)."
+                    )
+                else:
+                    detail = f"{database.progress_phase}…"
+            elif database.operation_total:
+                if database.operation_completed >= database.operation_total:
+                    detail = (
+                        f"All {database.operation_total:,} operations are complete; "
+                        "verifying both inventories."
+                    )
+                else:
+                    detail = (
+                        "Synchronization is in progress "
+                        f"({database.operation_completed:,} of "
+                        f"{database.operation_total:,} operations)."
+                    )
+            else:
+                detail = "Synchronization is in progress."
             return StatusSnapshot(
-                StatusKind.SYNCING, "Syncing", "Synchronization is in progress.",
+                StatusKind.SYNCING,
+                "Syncing",
+                detail,
                 config, systemd, database, account, auth_state,
             )
         if database.conflict:
@@ -280,6 +310,7 @@ class StatusProvider:
 def read_database_state(path: Path) -> DatabaseState:
     if not path.is_file():
         return DatabaseState()
+    sync_progress = None
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
             baseline = connection.execute(
@@ -306,6 +337,21 @@ def read_database_state(path: Path) -> DatabaseState:
             unresolved = connection.execute(
                 "SELECT 1 FROM conflicts WHERE resolved_at IS NULL LIMIT 1"
             ).fetchone()
+            progress = connection.execute(
+                "SELECT count(*), "
+                "sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) "
+                "FROM sync_operations WHERE run_id=("
+                "SELECT id FROM sync_runs WHERE outcome='running' "
+                "ORDER BY id DESC LIMIT 1)"
+            ).fetchone()
+            try:
+                sync_progress = connection.execute(
+                    "SELECT phase, completed, total FROM sync_progress "
+                    "WHERE singleton=1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # A GUI may start before the worker has applied migration 6.
+                sync_progress = None
     except (sqlite3.Error, OSError):
         return DatabaseState()
 
@@ -330,6 +376,11 @@ def read_database_state(path: Path) -> DatabaseState:
         latest_summary=str(latest[2]) if latest and latest[2] else None,
         conflict=bool(resolution or unresolved or plan_conflicts),
         conflicts=plan_conflicts,
+        operation_total=int(progress[0] or 0) if progress else 0,
+        operation_completed=int(progress[1] or 0) if progress else 0,
+        progress_phase=str(sync_progress[0]) if sync_progress else None,
+        progress_completed=int(sync_progress[1] or 0) if sync_progress else 0,
+        progress_total=int(sync_progress[2] or 0) if sync_progress else 0,
     )
 
 

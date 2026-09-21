@@ -7,6 +7,7 @@ import hashlib
 import os
 from pathlib import Path
 import stat
+from typing import Callable
 
 from sync_box.inventory import (
     InventoryItem,
@@ -23,6 +24,7 @@ def scan_local(
     hash_files: bool = False,
     excluded_paths: tuple[str, ...] = (),
     excluded_names: tuple[str, ...] = (),
+    progress: Callable[[int], None] | None = None,
 ) -> list[InventoryItem]:
     root = root.resolve(strict=False)
     if not root.is_dir():
@@ -34,6 +36,8 @@ def scan_local(
         raise ScanError(f"Cannot stat local synchronization root: {root}") from exc
 
     items = [_local_item(".", "folder", root_stat)]
+    if progress is not None:
+        progress(1)
     seen = {".": "."}
     pending: list[tuple[Path, tuple[str, ...]]] = [(root, ())]
 
@@ -71,6 +75,8 @@ def scan_local(
                 else None
             )
             items.append(_local_item(relative_path, item_type, item_stat, sha1=sha1))
+            if progress is not None:
+                progress(len(items))
         pending.extend(reversed(child_directories))
 
     return sorted(items, key=lambda item: item.relative_path)

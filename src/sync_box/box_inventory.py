@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from sync_box.box_errors import format_box_api_error
 from sync_box.inventory import (
@@ -35,6 +35,7 @@ def scan_box(
     *,
     excluded_paths: tuple[str, ...] = (),
     excluded_names: tuple[str, ...] = (),
+    progress: Callable[[int], None] | None = None,
 ) -> list[InventoryItem]:
     """Inventory Box metadata using GET-only SDK folder methods."""
     try:
@@ -46,6 +47,8 @@ def scan_box(
         ) from exc
 
     items = [_box_item(root, ".", forced_type="folder")]
+    if progress is not None:
+        progress(1)
     seen = {".": "."}
     pending: list[tuple[str, tuple[str, ...]]] = [(folder_id, ())]
 
@@ -80,6 +83,8 @@ def scan_box(
                 ensure_unique_path(seen, relative_path, original_path)
                 item_type = _enum_value(getattr(entry, "type", "other"))
                 items.append(_box_item(entry, relative_path, forced_type=item_type))
+                if progress is not None:
+                    progress(len(items))
                 if item_type == "folder":
                     pending.append((str(entry.id), parts))
 
