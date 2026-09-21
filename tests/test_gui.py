@@ -18,6 +18,7 @@ from sync_box.app_status import (
 from sync_box.gui import (
     MainWindow,
     SettingsDialog,
+    _next_sync_text,
     _rename_conflict_file,
     _suggested_conflict_name,
 )
@@ -183,6 +184,27 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertEqual(window.progress.value(), 25)
         self.assertIn("25 of 80 items", window.main_status.text())
         window.deleteLater()
+
+    def test_next_sync_uses_month_day_year_and_standard_time(self) -> None:
+        snapshot = StatusSnapshot(
+            StatusKind.UP_TO_DATE,
+            "Up to date",
+            "Synchronization is current.",
+            None,
+            SystemdState(
+                UnitState(),
+                UnitState(
+                    unit_file_state="enabled",
+                    next_elapse="Sun 2026-09-20 19:00:28 PDT",
+                ),
+            ),
+            DatabaseState(),
+        )
+
+        self.assertEqual(
+            _next_sync_text(snapshot),
+            "Next sync: September 20, 2026, 7:00 PM",
+        )
 
 
 if __name__ == "__main__":

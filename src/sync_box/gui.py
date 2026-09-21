@@ -1022,7 +1022,22 @@ def _next_sync_text(snapshot: StatusSnapshot) -> str:
     if not snapshot.systemd.timer_enabled:
         return "Next sync: Automatic synchronization disabled"
     value = snapshot.systemd.timer.next_elapse
-    return f"Next sync: {value}" if value else "Next sync: Scheduled by systemd"
+    if not value:
+        return "Next sync: Scheduled by systemd"
+    return f"Next sync: {_format_systemd_time(value)}"
+
+
+def _format_systemd_time(value: str) -> str:
+    parts = value.split()
+    for index in range(len(parts) - 1):
+        try:
+            parsed = datetime.strptime(
+                f"{parts[index]} {parts[index + 1]}", "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            continue
+        return parsed.strftime("%B %-d, %Y, %-I:%M %p")
+    return value
 
 
 def _secondary_detail(snapshot: StatusSnapshot) -> str:
