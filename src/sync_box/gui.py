@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
@@ -184,6 +185,7 @@ class SetupWizard(QDialog):
             self.accept()
             self.window.refresh_status()
             self.window.show_window()
+            QTimer.singleShot(0, self.window.check_authentication)
 
     def _resume(self) -> None:
         report = self.controller.requirements.check()
@@ -646,6 +648,8 @@ class MainWindow(QMainWindow):
         self.provider = provider or StatusProvider()
         self.auth_state = AuthenticationState.UNKNOWN
         self.account: str | None = None
+        self.box_space_used: int | None = None
+        self.box_space_amount: int | None = None
         self.sync_requested = False
         self._request_refreshes = 0
         self._quitting = False
@@ -762,7 +766,10 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(_section("BOX"))
         self.connection = QLabel("Checking connection…")
+        self.storage = QLabel("Checking storage usage…")
+        self.storage.setObjectName("secondary")
         layout.addWidget(self.connection)
+        layout.addWidget(self.storage)
         layout.addStretch()
 
         actions = QHBoxLayout()
@@ -852,6 +859,9 @@ class MainWindow(QMainWindow):
         count = snapshot.database.item_count
         self.items.setText(f"{count:,} items" if snapshot.database.has_baseline else "No verified baseline")
         self.connection.setText(_connection_text(snapshot))
+        self.storage.setText(
+            _storage_text(snapshot.auth_state, self.box_space_used, self.box_space_amount)
+        )
         usable = snapshot.config is not None and snapshot.database.has_baseline
         self.sync_button.setEnabled(usable and snapshot.kind is not StatusKind.SYNCING)
         self.sync_action.setEnabled(self.sync_button.isEnabled())
@@ -882,7 +892,10 @@ class MainWindow(QMainWindow):
         process = QProcess(self)
         self.auth_process = process
         process.finished.connect(self._authentication_finished)
-        process.start(command[0], [*command[1:], "--config", str(self.provider.config_path), "auth", "test"])
+        process.start(command[0], [
+            *command[1:], "--config", str(self.provider.config_path),
+            "auth", "test", "--json",
+        ])
 
     def authenticate(self) -> None:
         if self.snapshot.config is None or self.auth_process is not None:
@@ -890,8 +903,19 @@ class MainWindow(QMainWindow):
         command = cli_command()
         process = QProcess(self)
         self.auth_process = process
-        process.finished.connect(self._authentication_finished)
+        process.finished.connect(self._login_finished)
         process.start(command[0], [*command[1:], "--config", str(self.provider.config_path), "auth", "login", "--reauthorize"])
+
+    def _login_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        self.auth_process = None
+        if exit_code == 0:
+            self.check_authentication()
+            return
+        self.auth_state = AuthenticationState.REQUIRED
+        self.account = None
+        self.box_space_used = None
+        self.box_space_amount = None
+        self.refresh_status()
 
     def _authentication_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         process = self.auth_process
@@ -900,12 +924,20 @@ class MainWindow(QMainWindow):
             return
         output = bytes(process.readAllStandardOutput()).decode(errors="replace").strip()
         if exit_code == 0:
-            self.auth_state = AuthenticationState.CONNECTED
-            marker = "Authenticated to Box as "
-            self.account = output.split(marker, 1)[1].rsplit(" (user ID", 1)[0] if marker in output else "Connected"
+            account = _parse_account_status(output)
+            if account is None:
+                self.auth_state = AuthenticationState.REQUIRED
+                self.account = None
+                self.box_space_used = None
+                self.box_space_amount = None
+            else:
+                self.auth_state = AuthenticationState.CONNECTED
+                self.account, self.box_space_used, self.box_space_amount = account
         else:
             self.auth_state = AuthenticationState.REQUIRED
             self.account = None
+            self.box_space_used = None
+            self.box_space_amount = None
         self.refresh_status()
 
     def open_folder(self) -> None:
@@ -1054,6 +1086,50 @@ def _connection_text(snapshot: StatusSnapshot) -> str:
     if snapshot.auth_state is AuthenticationState.CHECKING:
         return "Checking Box connection…"
     return "Box connection has not been checked"
+
+
+def _parse_account_status(output: str) -> tuple[str, int | None, int | None] | None:
+    try:
+        value = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("name"), str):
+        return None
+    used = _json_byte_count(value.get("space_used"))
+    amount = _json_byte_count(value.get("space_amount"))
+    return value["name"], used, amount
+
+
+def _json_byte_count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _storage_text(
+    auth_state: AuthenticationState,
+    used: int | None,
+    amount: int | None,
+) -> str:
+    if auth_state is AuthenticationState.CHECKING:
+        return "Checking storage usage…"
+    if auth_state is not AuthenticationState.CONNECTED:
+        return "Storage usage unavailable"
+    if used is None or amount is None:
+        return "Storage usage unavailable"
+    free = max(amount - used, 0)
+    return f"{_format_bytes(used)} used · {_format_bytes(free)} free"
+
+
+def _format_bytes(value: int) -> str:
+    size = float(value)
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    unit = units[0]
+    for unit in units:
+        if size < 1000 or unit == units[-1]:
+            break
+        size /= 1000
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.1f}".rstrip("0").rstrip(".") + f" {unit}"
 
 
 def _state_icon(color: str) -> QIcon:

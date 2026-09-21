@@ -12,10 +12,28 @@ from sync_box.box_auth import (
     authorize,
     build_authenticated_client,
     build_write_authenticated_client,
+    get_account_info,
 )
 
 
 class AuthenticationTests(unittest.TestCase):
+    @patch("sync_box.box_auth.build_authenticated_client")
+    def test_account_info_includes_storage_quota(self, build_client: Mock) -> None:
+        user = SimpleNamespace(
+            id="123", name="Person", space_used=15_000_000_000,
+            space_amount=100_000_000_000,
+        )
+        build_client.return_value.users.get_user_me.return_value = user
+
+        account = get_account_info(SimpleNamespace())
+
+        self.assertEqual(account.name, "Person")
+        self.assertEqual(account.space_used, 15_000_000_000)
+        self.assertEqual(account.space_amount, 100_000_000_000)
+        build_client.return_value.users.get_user_me.assert_called_once_with(
+            fields=["id", "name", "space_used", "space_amount"]
+        )
+
     def test_version_parser_accepts_current_cli_formats(self) -> None:
         self.assertEqual(_parse_version("@box/cli/4.10.0 linux-x64"), (4, 10, 0))
         self.assertEqual(_parse_version("box-cli/4.6.0 linux-x64"), (4, 6, 0))

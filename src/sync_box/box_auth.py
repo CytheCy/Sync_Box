@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
@@ -21,6 +22,14 @@ READ_WRITE_SCOPES = "root_readwrite,item_download"
 
 class AuthenticationError(RuntimeError):
     """Raised for missing, invalid, or failed Box authentication."""
+
+
+@dataclass(frozen=True, slots=True)
+class AccountInfo:
+    user_id: str
+    name: str
+    space_used: int | None
+    space_amount: int | None
 
 
 def authorize(*, reauthorize: bool = False, code: bool = False) -> None:
@@ -65,14 +74,37 @@ def build_write_authenticated_client(config: AppConfig) -> Any:
 
 
 def test_authentication(config: AppConfig) -> tuple[str, str]:
+    account = get_account_info(config)
+    return account.user_id, account.name
+
+
+def get_account_info(config: AppConfig) -> AccountInfo:
+    """Return the current Box user and any storage quota exposed by Box."""
     client = build_authenticated_client(config)
     try:
-        user = client.users.get_user_me(fields=["id", "name"])
+        user = client.users.get_user_me(
+            fields=["id", "name", "space_used", "space_amount"]
+        )
     except Exception as exc:
         raise AuthenticationError(
             f"Box authentication test failed: {format_box_api_error(exc)}"
         ) from exc
-    return str(user.id), str(user.name)
+    return AccountInfo(
+        user_id=str(user.id),
+        name=str(user.name),
+        space_used=_optional_nonnegative_int(getattr(user, "space_used", None)),
+        space_amount=_optional_nonnegative_int(getattr(user, "space_amount", None)),
+    )
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _read_only_access_token() -> str:

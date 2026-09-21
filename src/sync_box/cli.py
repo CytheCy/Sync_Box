@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ from time import monotonic
 from sync_box.box_auth import (
     AuthenticationError,
     authorize,
+    get_account_info,
     test_authentication,
 )
 from sync_box.box_errors import safe_error_detail
@@ -88,7 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="manually enter the authorization code for a headless machine",
     )
-    auth_commands.add_parser("test", help="make a read-only current-user API call")
+    test_parser = auth_commands.add_parser(
+        "test", help="make a read-only current-user API call"
+    )
+    test_parser.add_argument(
+        "--json", action="store_true", help="display account and storage details as JSON"
+    )
 
     inventory_parser = subparsers.add_parser(
         "inventory", help="scan metadata without changing local or Box content"
@@ -254,8 +261,17 @@ def _handle_auth(args: argparse.Namespace, config: AppConfig) -> int:
         authorize(reauthorize=args.reauthorize, code=args.code)
         print("Box authorization completed; credentials are managed by the Box CLI")
     else:
-        user_id, user_name = test_authentication(config)
-        print(f"Authenticated to Box as {user_name} (user ID {user_id})")
+        if args.json:
+            account = get_account_info(config)
+            print(json.dumps({
+                "user_id": account.user_id,
+                "name": account.name,
+                "space_used": account.space_used,
+                "space_amount": account.space_amount,
+            }))
+        else:
+            user_id, user_name = test_authentication(config)
+            print(f"Authenticated to Box as {user_name} (user ID {user_id})")
     return 0
 
 

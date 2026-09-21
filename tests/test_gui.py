@@ -19,7 +19,9 @@ from sync_box.gui import (
     MainWindow,
     SettingsDialog,
     _next_sync_text,
+    _parse_account_status,
     _rename_conflict_file,
+    _storage_text,
     _suggested_conflict_name,
 )
 
@@ -205,6 +207,38 @@ class GuiBehaviorTests(unittest.TestCase):
             _next_sync_text(snapshot),
             "Next sync: September 20, 2026, 7:00 PM",
         )
+
+    def test_box_storage_shows_used_and_free_space(self) -> None:
+        account = _parse_account_status(
+            '{"name":"Person","space_used":15000000000,'
+            '"space_amount":100000000000}'
+        )
+
+        self.assertEqual(account, ("Person", 15_000_000_000, 100_000_000_000))
+        self.assertEqual(
+            _storage_text(AuthenticationState.CONNECTED, account[1], account[2]),
+            "15 GB used · 85 GB free",
+        )
+
+        window, provider = self.make_window()
+        window.auth_state = AuthenticationState.CONNECTED
+        window.account = account[0]
+        window.box_space_used = account[1]
+        window.box_space_amount = account[2]
+        provider.snapshot = StatusSnapshot(
+            provider.snapshot.kind,
+            provider.snapshot.title,
+            provider.snapshot.detail,
+            provider.snapshot.config,
+            provider.snapshot.systemd,
+            provider.snapshot.database,
+            account=account[0],
+            auth_state=AuthenticationState.CONNECTED,
+        )
+        window.refresh_status()
+
+        self.assertEqual(window.storage.text(), "15 GB used · 85 GB free")
+        window.deleteLater()
 
 
 if __name__ == "__main__":
