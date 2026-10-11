@@ -84,6 +84,36 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertEqual(icons_at_show, [False])
         window.deleteLater()
 
+    def test_tray_only_launch_skips_setup(self) -> None:
+        provider = FakeProvider(Path(self.temporary.name))
+        with patch("sync_box.gui.QTimer.singleShot") as schedule:
+            window = MainWindow(provider, tray_only=True)
+        callback = schedule.call_args.args[1]
+        self.assertEqual(callback, window.check_authentication)
+        self.assertIsNone(window.setup_wizard)
+        window.tray.hide()
+        window.deleteLater()
+
+    def test_existing_baseline_opens_monitor_without_setup_check(self) -> None:
+        window, _provider = self.make_window()
+        window.snapshot = StatusSnapshot(
+            StatusKind.UP_TO_DATE,
+            "Up to date",
+            "Everything is synchronized",
+            object(),
+            SystemdState(UnitState(), UnitState()),
+            DatabaseState(has_baseline=True),
+        )
+        with patch("sync_box.gui.SetupController") as setup, patch.object(
+            window, "check_authentication"
+        ) as check_authentication:
+            window._start_application()
+        setup.assert_not_called()
+        check_authentication.assert_called_once()
+        self.assertIsNone(window.setup_wizard)
+        window.tray.hide()
+        window.deleteLater()
+
     def test_quit_does_not_disable_timer(self) -> None:
         window, provider = self.make_window()
         with patch.object(QApplication, "quit") as quit_method:

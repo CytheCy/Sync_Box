@@ -643,7 +643,7 @@ class ConflictDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, provider: StatusProvider | None = None) -> None:
+    def __init__(self, provider: StatusProvider | None = None, *, tray_only: bool = False) -> None:
         super().__init__()
         self.provider = provider or StatusProvider()
         self.auth_state = AuthenticationState.UNKNOWN
@@ -666,19 +666,10 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.refresh_status)
         self.poll_timer.start(3000)
-        QTimer.singleShot(100, self._start_application)
+        QTimer.singleShot(100, self.check_authentication if tray_only else self._start_application)
 
     def _start_application(self) -> None:
-        report = SetupController(
-            self.provider.config_path, systemd=self.provider.controller
-        ).requirements.check()
-        setup_complete = (
-            report.config is not None
-            and report.database.has_baseline
-            and report.systemd.timer_enabled
-            and report.systemd.timer.running
-        )
-        if setup_complete:
+        if self.snapshot.config is not None and self.snapshot.database.has_baseline:
             self.check_authentication()
             return
         self.hide()
@@ -1166,7 +1157,8 @@ QMenu::item:selected { background: #38414a; }
 
 
 def main() -> int:
-    application = QApplication(sys.argv)
+    tray_only = "--tray-only" in sys.argv[1:]
+    application = QApplication([arg for arg in sys.argv if arg != "--tray-only"])
     application.setApplicationName("Sync_Box")
     application.setDesktopFileName("sync-box")
     if os.geteuid() == 0:
@@ -1190,8 +1182,9 @@ def main() -> int:
     application.setQuitOnLastWindowClosed(False)
     application.setStyle("Fusion")
     application.setStyleSheet(STYLESHEET)
-    window = MainWindow()
-    window.show()
+    window = MainWindow(tray_only=tray_only)
+    if not tray_only:
+        window.show()
     return application.exec()
 
 
