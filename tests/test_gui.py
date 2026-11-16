@@ -60,6 +60,39 @@ class GuiBehaviorTests(unittest.TestCase):
             window = MainWindow(provider)
         return window, provider
 
+    def test_automatic_changes_wait_for_connection_and_busy_service(self):
+        from dataclasses import replace
+        window, provider = self.make_window()
+        window.snapshot = replace(window.snapshot, config=object(), database=DatabaseState(has_baseline=True))
+        window._dirty = True
+        window.auth_state = AuthenticationState.REQUIRED
+        window._automatic_sync()
+        self.assertTrue(window._dirty)
+        provider.controller.start_sync.assert_not_called()
+        window.auth_state = AuthenticationState.CONNECTED
+        window.sync_requested = True
+        window._automatic_sync()
+        provider.controller.start_sync.assert_not_called()
+        window.debounce.stop()
+        window.deleteLater()
+
+    def test_automatic_changes_start_once_and_clear_pending_login(self):
+        from dataclasses import replace
+        from sync_box.app_status import StartResult
+        window, provider = self.make_window()
+        window.snapshot = replace(window.snapshot, config=object(), database=DatabaseState(has_baseline=True))
+        window.auth_state = AuthenticationState.CONNECTED
+        window._dirty = True
+        window._login_pending = True
+        provider.controller.start_sync.return_value = StartResult(True)
+        with patch.object(window, 'refresh_status'):
+            window._automatic_sync()
+        provider.controller.start_sync.assert_called_once()
+        self.assertFalse(window._dirty)
+        self.assertFalse(window._login_pending)
+        self.assertTrue(window.sync_requested)
+        window.deleteLater()
+
     def test_close_hides_window_for_tray_operation(self) -> None:
         window, _provider = self.make_window()
         window.show()
@@ -268,6 +301,9 @@ class GuiBehaviorTests(unittest.TestCase):
         window.refresh_status()
 
         self.assertEqual(window.storage.text(), "15 GB used · 85 GB free")
+        self.assertEqual(window.storage_bar.value(), 150)
+        self.assertEqual(window.storage_bar.format(), "15.0% used · 85.0% free")
+        self.assertIn("100 GB total", window.storage_bar.toolTip())
         window.deleteLater()
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
+import shutil
+import sys
 
 
 AUTOSTART_NAME = "sync-box.desktop"
@@ -31,10 +33,12 @@ def set_autostart(enabled: bool, path: Path | None = None) -> Path:
     target = path or user_autostart_path()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     hidden = "false" if enabled else "true"
+    executable = shutil.which("sync-box-gui") or str(Path(sys.executable).parent / "sync-box-gui")
+    executable = executable.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("`", "\\`").replace("$", "\\$")
     contents = f"""[Desktop Entry]
 Type=Application
 Name=Sync_Box
-Exec=/usr/bin/sync-box-gui
+Exec="{executable}" --tray-only --login
 Icon=sync-box
 Terminal=false
 X-GNOME-Autostart-enabled={str(enabled).lower()}

@@ -17,6 +17,7 @@ BuildRequires:  libappstream-glib
 Requires:       python3dist(boxsdk) >= 10
 Requires:       python3dist(boxsdk) < 11
 Requires:       python3dist(pyside6) >= 6.6
+Requires:       python3dist(watchdog) >= 4
 Requires:       python3 >= 3.11
 Requires:       systemd
 Requires:       libsecret

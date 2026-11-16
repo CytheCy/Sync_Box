@@ -8,16 +8,24 @@ import logging
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import sqlite3
 import sys
 
-from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal, QEvent
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
     QMessageBox, QProgressBar,
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
+
+from sync_box.desktop_sync import (
+    INTERVALS, Preferences, load_preferences, save_preferences, set_sync_interval, transfer_history,
+)
+from sync_box.folder_watch import FolderWatcher
+from sync_box.systemd_units import SystemdUnitError
 
 from sync_box.app_status import (
     AuthenticationState, ConflictDetail, StatusKind, StatusProvider, StatusSnapshot,
@@ -84,7 +92,7 @@ class SetupWizard(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         self.kicker = _section("WELCOME")
-        self.title = QLabel("Sync_Box")
+        self.title = QLabel("Box Cloud Sync")
         self.title.setObjectName("appTitle")
         self.body = QLabel()
         self.body.setWordWrap(True)
@@ -424,8 +432,11 @@ class SettingsDialog(QDialog):
         self.box_url = QLineEdit()
         self.box_url.setPlaceholderText("https://app.box.com/folder/…")
         form.addRow("Box folder URL", self.box_url)
-        self.schedule = QLabel("Every 30 minutes with a stable delay of up to 2 minutes")
-        self.schedule.setWordWrap(True)
+        self.schedule = QComboBox()
+        for minutes in INTERVALS:
+            label = f"Every {minutes} minutes" if minutes < 60 else f"Every {minutes // 60} hour(s)"
+            self.schedule.addItem(label, minutes)
+        self.schedule.setCurrentIndex(INTERVALS.index(window.preferences.interval))
         form.addRow("Schedule", self.schedule)
         self.account = QLabel("Checking…")
         form.addRow("Box connection", self.account)
@@ -446,7 +457,13 @@ class SettingsDialog(QDialog):
                 "Authenticate Box and establish a verified baseline before enabling automatic synchronization."
             )
         layout.addWidget(self.timer)
-        self.autostart = QCheckBox("Start the tray application when I sign in")
+        self.watch = QCheckBox("Sync automatically when the local Box folder changes")
+        self.watch.setChecked(window.preferences.watch_folder)
+        layout.addWidget(self.watch)
+        self.login_sync = QCheckBox("Automatically sync at login")
+        self.login_sync.setChecked(window.preferences.sync_at_login)
+        layout.addWidget(self.login_sync)
+        self.autostart = QCheckBox("Launch at login")
         self.autostart.setChecked(autostart_enabled())
         layout.addWidget(self.autostart)
 
@@ -501,8 +518,14 @@ class SettingsDialog(QDialog):
                 ok, message = self.window.provider.controller.set_timer_enabled(self.timer.isChecked())
                 if not ok:
                     raise SetupError(message)
+            preferences = Preferences(self.schedule.currentData(), self.watch.isChecked(), self.login_sync.isChecked())
+            if preferences.interval != self.window.preferences.interval:
+                set_sync_interval(preferences.interval, enabled=self.timer.isChecked())
             set_autostart(self.autostart.isChecked())
-        except (OSError, SetupError) as exc:
+            save_preferences(preferences)
+            self.window.preferences = preferences
+            self.window.update_watcher()
+        except (OSError, SetupError, SystemdUnitError) as exc:
             QMessageBox.warning(self, "Settings not saved", str(exc))
             return
         self.window.refresh_status()
@@ -646,6 +669,17 @@ class MainWindow(QMainWindow):
     def __init__(self, provider: StatusProvider | None = None, *, tray_only: bool = False) -> None:
         super().__init__()
         self.provider = provider or StatusProvider()
+        self.preferences = load_preferences()
+        self._login_pending = "--login" in sys.argv and self.preferences.sync_at_login
+        self._dirty = False
+        self._history_rows = None
+        self._history_task = None
+        self._watch_error = None
+        self.watcher = FolderWatcher(self)
+        self.watcher.changed.connect(self._folder_changed)
+        self.debounce = QTimer(self)
+        self.debounce.setSingleShot(True)
+        self.debounce.timeout.connect(self._automatic_sync)
         self.auth_state = AuthenticationState.UNKNOWN
         self.account: str | None = None
         self.box_space_used: int | None = None
@@ -656,16 +690,25 @@ class MainWindow(QMainWindow):
         self.auth_process: QProcess | None = None
         self.setup_wizard: SetupWizard | None = None
         self.snapshot = self.provider.read()
-        self.setWindowTitle("Sync_Box")
+        self.setWindowTitle("Box Cloud Sync")
         self.setWindowIcon(QIcon(str(icon_path())))
-        self.resize(540, 520)
-        self.setMinimumSize(500, 460)
+        self.resize(850, 820)
+        self.setMinimumSize(650, 650)
         self._build_window()
         self._build_tray()
         self.refresh_status()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.refresh_status)
-        self.poll_timer.start(3000)
+        self.poll_timer.start(5000)
+        self.auth_timer = QTimer(self)
+        self.auth_timer.timeout.connect(self.check_authentication)
+        self.auth_timer.start(60000)
+        self.history_timer = QTimer(self)
+        self.history_timer.timeout.connect(self.refresh_history)
+        self.history_timer.start(10000)
+        self.update_watcher()
+        self.refresh_history()
+        QApplication.instance().aboutToQuit.connect(self._shutdown)
         QTimer.singleShot(100, self.check_authentication if tray_only else self._start_application)
 
     def _start_application(self) -> None:
@@ -679,17 +722,19 @@ class MainWindow(QMainWindow):
 
     def _setup_closed(self) -> None:
         if self.setup_wizard and self.setup_wizard.result() == QDialog.DialogCode.Accepted:
+            self.update_watcher()
+            self.refresh_history()
             self.show_window()
 
     def _build_window(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(9)
 
         header = QHBoxLayout()
-        title = QLabel("Sync_Box")
+        title = QLabel("Box Cloud Sync")
         title.setObjectName("appTitle")
         self.header_status = QLabel()
         header.addWidget(title)
@@ -701,6 +746,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(_section("SYNC STATUS"))
         self.main_status = QLabel()
         self.main_status.setObjectName("mainStatus")
+        self.main_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.main_status.setWordWrap(True)
         self.detail = QLabel()
         self.detail.setObjectName("secondary")
         self.last_sync = QLabel()
@@ -743,6 +790,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(_section("LOCAL FOLDER"))
         local_row = QHBoxLayout()
         self.folder = QLabel("Not selected")
+        self.folder.setTextFormat(Qt.TextFormat.PlainText)
+        self.folder.setWordWrap(True)
         self.folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.open_folder_button = QPushButton("…")
         self.open_folder_button.setFixedWidth(36)
@@ -761,7 +810,33 @@ class MainWindow(QMainWindow):
         self.storage.setObjectName("secondary")
         layout.addWidget(self.connection)
         layout.addWidget(self.storage)
-        layout.addStretch()
+        self.storage_bar = QProgressBar()
+        self.storage_bar.setObjectName("storageBar")
+        self.storage_bar.setAccessibleName("Box storage usage")
+        self.storage_bar.setRange(0, 1000)
+        self.storage_bar.setMinimumHeight(24)
+        self.storage_bar.setTextVisible(True)
+        layout.addWidget(self.storage_bar)
+        self.watch_status = QLabel("Watching local changes in the background")
+        self.watch_status.setObjectName("secondary")
+        layout.addWidget(self.watch_status)
+        layout.addSpacing(12)
+        layout.addWidget(_section("TRANSFER ACTIVITY · LAST 48 HOURS"))
+        self.history_summary = QLabel("Loading transfer history…")
+        self.history_summary.setObjectName("secondary")
+        layout.addWidget(self.history_summary)
+        self.history = QTableWidget(0, 4)
+        self.history.setHorizontalHeaderLabels(["Time", "Direction", "File", "Status"])
+        self.history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.history.setColumnWidth(0, 175)
+        self.history.setColumnWidth(1, 100)
+        self.history.verticalHeader().hide()
+        self.history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history.setAlternatingRowColors(True)
+        self.history.setMinimumHeight(180)
+        self.history.setWordWrap(False)
+        layout.addWidget(self.history, 1)
 
         actions = QHBoxLayout()
         self.sync_button = QPushButton("Sync Now")
@@ -771,6 +846,9 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings)
         actions.addWidget(self.sync_button)
         actions.addStretch()
+        background = QPushButton("Minimize to tray")
+        background.clicked.connect(self.hide)
+        actions.addWidget(background)
         actions.addWidget(self.settings_button)
         layout.addLayout(actions)
 
@@ -853,6 +931,24 @@ class MainWindow(QMainWindow):
         self.storage.setText(
             _storage_text(snapshot.auth_state, self.box_space_used, self.box_space_amount)
         )
+        used, total = self.box_space_used, self.box_space_amount
+        storage_available = (
+            snapshot.auth_state is AuthenticationState.CONNECTED
+            and used is not None and total is not None and total > 0
+        )
+        self.storage_bar.setEnabled(storage_available)
+        if storage_available:
+            fraction = max(0.0, min(1.0, used / total))
+            self.storage_bar.setValue(round(fraction * 1000))
+            self.storage_bar.setFormat(f"{fraction:.1%} used · {1 - fraction:.1%} free")
+            self.storage_bar.setToolTip(
+                f"{_format_bytes(used)} used of {_format_bytes(total)} total · "
+                f"{_format_bytes(max(0, total - used))} free"
+            )
+        else:
+            self.storage_bar.setValue(0)
+            self.storage_bar.setFormat("Storage usage unavailable")
+            self.storage_bar.setToolTip("Connect to Box to check your storage quota.")
         usable = snapshot.config is not None and snapshot.database.has_baseline
         self.sync_button.setEnabled(usable and snapshot.kind is not StatusKind.SYNCING)
         self.sync_action.setEnabled(self.sync_button.isEnabled())
@@ -863,6 +959,82 @@ class MainWindow(QMainWindow):
         icon = _state_icon(color)
         self.tray.setIcon(icon)
         self.tray.setToolTip(f"Sync_Box — {snapshot.title}")
+
+    def update_watcher(self) -> None:
+        root = validated_local_folder(self.snapshot.config)
+        try:
+            if root and self.preferences.watch_folder:
+                self.watcher.start(root)
+            else:
+                self.watcher.stop()
+                self._dirty = False
+            self._watch_error = None
+        except OSError as exc:
+            self._watch_error = str(exc)
+            log_failure(LOGGER, "Could not watch Box folder", exc)
+        if self._watch_error:
+            self.watch_status.setText("Folder monitoring unavailable — periodic sync still runs. See logs.")
+        else:
+            self.watch_status.setText("Watching local changes • sync after files settle" if self.watcher.root else "Folder change sync is off")
+
+    def _folder_changed(self) -> None:
+        self._dirty = True
+        self.debounce.start(5000)
+
+    def _automatic_sync(self) -> None:
+        if not (self._dirty or self._login_pending):
+            return
+        if not self.snapshot.config or not self.snapshot.database.has_baseline:
+            self.debounce.start(30000)
+            return
+        if self.auth_state is not AuthenticationState.CONNECTED:
+            self.debounce.start(30000)
+            return
+        if self.sync_requested or self.snapshot.systemd.service.running:
+            self.debounce.start(5000)
+            return
+        result = self.provider.controller.start_sync(self.snapshot.systemd)
+        if result.accepted:
+            self._dirty = False
+            self._login_pending = False
+            self.sync_requested = True
+            self._request_refreshes = 0
+        else:
+            self.debounce.start(30000)
+        self.refresh_status()
+
+    def refresh_history(self) -> None:
+        if self._history_task or not self.snapshot.config:
+            return
+        path = self.snapshot.config.state_database
+        self._history_task = _Task(lambda: transfer_history(path), self._history_finished)
+        QThreadPool.globalInstance().start(self._history_task)
+
+    def _history_finished(self, rows, error) -> None:
+        self._history_task = None
+        if error:
+            self.history_summary.setText("Transfer history temporarily unavailable")
+            return
+        completed = [row for row in rows if row[3] == "completed"]
+        uploads = sum(row[1].startswith("upload") for row in completed)
+        self.history_summary.setText(f"↑ {uploads:,} uploads   ↓ {len(completed) - uploads:,} downloads" if rows else "No uploads or downloads in the last 48 hours")
+        if rows == self._history_rows:
+            return
+        self._history_rows = rows
+        position = self.history.verticalScrollBar().value()
+        self.history.setRowCount(len(rows))
+        for index, (time, action, path, status) in enumerate(rows):
+            parsed = datetime.fromisoformat(time.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                from datetime import timezone
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            values = (parsed.astimezone().strftime("%b %d, %I:%M %p"),
+                      "↑ Upload" if action.startswith("upload") else "↓ Download", path, status.capitalize())
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.history.setItem(index, column, item)
+        self.history.verticalScrollBar().setValue(position)
 
     def sync_now(self) -> None:
         result = self.provider.controller.start_sync(self.snapshot.systemd)
@@ -883,6 +1055,8 @@ class MainWindow(QMainWindow):
         process = QProcess(self)
         self.auth_process = process
         process.finished.connect(self._authentication_finished)
+        process.errorOccurred.connect(lambda _error: self._authentication_finished(1, QProcess.ExitStatus.CrashExit) if self.auth_process is process else None)
+        QTimer.singleShot(45000, process, lambda: process.kill() if process.state() != QProcess.ProcessState.NotRunning else None)
         process.start(command[0], [
             *command[1:], "--config", str(self.provider.config_path),
             "auth", "test", "--json",
@@ -914,6 +1088,7 @@ class MainWindow(QMainWindow):
         if process is None:
             return
         output = bytes(process.readAllStandardOutput()).decode(errors="replace").strip()
+        process.deleteLater()
         if exit_code == 0:
             account = _parse_account_status(output)
             if account is None:
@@ -930,6 +1105,8 @@ class MainWindow(QMainWindow):
             self.box_space_used = None
             self.box_space_amount = None
         self.refresh_status()
+        if self._login_pending or self._dirty:
+            self.debounce.start(1000)
 
     def open_folder(self) -> None:
         folder = validated_local_folder(self.snapshot.config)
@@ -959,10 +1136,25 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _shutdown(self) -> None:
+        self.watcher.stop()
+        if self.auth_process is not None:
+            process = self.auth_process
+            self.auth_process = None
+            process.finished.disconnect()
+            process.errorOccurred.disconnect()
+            process.kill()
+            process.waitForFinished(1000)
+
     def quit_gui(self) -> None:
         self._quitting = True
         self.tray.hide()
         QApplication.instance().quit()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.hide)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._quitting:
@@ -1138,9 +1330,9 @@ def _state_icon(color: str) -> QIcon:
 
 
 STYLESHEET = """
-QWidget { background: #202328; color: #e5e8eb; font-size: 13px; }
-QMainWindow, QDialog { background: #202328; }
-QLabel#appTitle { font-size: 16px; font-weight: 600; }
+QWidget { background: #171e29; color: #e5e8eb; font-size: 13px; }
+QMainWindow, QDialog { background: #171e29; }
+QLabel#appTitle { font-size: 26px; font-weight: 700; }
 QLabel#mainStatus { font-size: 14px; font-weight: 600; }
 QLabel#secondary { color: #9299a1; }
 QLabel#section { color: #858d96; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
@@ -1150,6 +1342,12 @@ QPushButton:disabled { color: #737981; background: #262a2f; }
 QPushButton[primary="true"] { background: #327cad; border-color: #3e90c7; color: white; }
 QProgressBar { background: #2a2e34; border: 0; border-radius: 2px; }
 QProgressBar::chunk { background: #4aa3df; border-radius: 2px; }
+QProgressBar#storageBar { background: #34465d; border: 1px solid #44556d; border-radius: 6px; text-align: center; color: white; }
+QProgressBar#storageBar::chunk { background: #327cad; border-radius: 5px; }
+QTableWidget { background: #1e2938; alternate-background-color: #222f40; border: 1px solid #34465d; border-radius: 10px; gridline-color: #2e3c50; selection-background-color: #285479; }
+QHeaderView::section { background: #253349; color: #b6cce3; padding: 10px; border: none; }
+QComboBox { padding: 7px; border: 1px solid #44556d; border-radius: 6px; }
+QCheckBox { spacing: 10px; padding: 5px; }
 QMenu { background: #292d33; border: 1px solid #414750; padding: 4px; }
 QMenu::item { padding: 6px 24px 6px 10px; border-radius: 4px; }
 QMenu::item:selected { background: #38414a; }
@@ -1157,8 +1355,21 @@ QMenu::item:selected { background: #38414a; }
 
 
 def main() -> int:
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     tray_only = "--tray-only" in sys.argv[1:]
     application = QApplication([arg for arg in sys.argv if arg != "--tray-only"])
+    server_name = f"sync-box-desktop-{os.getuid()}"
+    socket = QLocalSocket()
+    socket.connectToServer(server_name)
+    if socket.waitForConnected(500):
+        socket.write(b"tray" if tray_only else b"show")
+        socket.waitForBytesWritten(500)
+        return 0
+    QLocalServer.removeServer(server_name)
+    server = QLocalServer(application)
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(server_name):
+        return 1
     application.setApplicationName("Sync_Box")
     application.setDesktopFileName("sync-box")
     if os.geteuid() == 0:
@@ -1180,9 +1391,19 @@ def main() -> int:
         LOGGER, "Unhandled GUI failure", error
     )
     application.setQuitOnLastWindowClosed(False)
-    application.setStyle("Fusion")
     application.setStyleSheet(STYLESHEET)
     window = MainWindow(tray_only=tray_only)
+    def received():
+        connection = server.nextPendingConnection()
+        def ready():
+            if bytes(connection.readAll()) == b"show":
+                window.show_window()
+            connection.disconnectFromServer()
+            connection.deleteLater()
+        connection.readyRead.connect(ready)
+        if connection.bytesAvailable():
+            ready()
+    server.newConnection.connect(received)
     if not tray_only:
         window.show()
     return application.exec()

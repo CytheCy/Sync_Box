@@ -6,6 +6,29 @@ an external SQLite baseline, and short-lived downscoped tokens. Inventories and
 dry runs use read-only access. An executing sync obtains a separate content
 read/write token only for that run.
 
+## Desktop cloud sync
+
+The Qt 6 desktop app now combines a system tray monitor, background folder
+notifications, and a scrollable upload/download journal for the last 48 hours.
+Close the window or choose **Minimize to tray** to keep watching local changes.
+**Quit** stops folder monitoring; the independent systemd timer keeps running.
+Launching the app again opens the existing window rather than another monitor.
+
+In **Settings**, choose a cloud-check interval from 5 minutes to 24 hours
+(default: 30 minutes), enable folder-change syncing, **Launch at login**, and
+**Automatically sync at login**. Login syncing requires Launch at login. Local
+changes settle for five seconds before requesting the existing systemd service;
+changes during a run are queued for another pass. Offline requests wait for the
+connection check to recover. Box connectivity is checked every minute.
+
+Preferences live in `~/.config/sync-box/desktop.json`. Schedule changes use a
+user timer drop-in and preserve the installed service. Transfer history reads
+the engine's durable operation journal, including failed and pending transfers;
+its times refer to the containing sync run. Empty/no-change runs are not transfers.
+Authentication and baseline verification remain required for automatic syncing.
+Install the GUI dependencies for a development checkout with
+`.venv/bin/pip install -e '.[gui]'`.
+
 ## Install on Fedora
 
 The Fedora RPM installs the CLI, Qt tray application, desktop launcher, optional
