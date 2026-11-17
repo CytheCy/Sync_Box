@@ -227,7 +227,7 @@ but never traversed.
 
 ## Database and logs
 
-Initialize a new database or migrate an older database to schema v7:
+Initialize a new database or migrate an older database to schema v8:
 
 ```bash
 sync-box init
@@ -280,6 +280,28 @@ sync-box run
 ```
 
 Execution rejects any plan containing a conflict before changing either tree.
+When the first fresh inventories match the paired baseline and the plan
+is empty, the run records success without obtaining a write token, rescanning,
+or replacing the baseline.
+This comparison ignores folder summary metadata and Box-only items in one-way
+folders, as those do not require synchronization. File metadata, folder paths,
+and folder identities must still match.
+
+Normal runs cache local file SHA-1 hashes in the state database, scoped to the
+resolved local root and relative path. Reuse requires matching device, inode,
+size, mode, and nanosecond modification and change timestamps. Each cached file
+is opened without following a symlink and checked again before reuse. Entries
+expire 24 hours after their last full hash; cache hits never renew that deadline.
+Deleted, renamed, excluded, or non-file entries are removed after a successful
+scan. A failed scan never commits partial cache updates. Normal runs log counts
+of reused and freshly computed hashes.
+
+Dry runs, baseline creation, conflict-resolution scans, and final verification
+after execution always hash contents. Final verification also refreshes the cache;
+uploads retain their independent content checks. The first cached run hashes all
+files. Like other metadata caches, this assumes filesystem identity and timestamps
+are reliable; periodic full hashing checks for changes they fail to reveal.
+
 It journals each operation, binds the run to its baseline generation, and holds
 a nonblocking lock on both the local root and state database through mutation
 and verification. The exact plan is rebuilt under those locks and must remain

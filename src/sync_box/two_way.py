@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 
 from sync_box.inventory import InventoryItem, ScanError
@@ -60,6 +60,35 @@ def validate_baseline_match(
                 raise ScanError(f"Baseline refused at {path!r}: SHA-1 differs")
         if right.content_id is None:
             raise ScanError(f"Baseline refused at {path!r}: Box ID unavailable")
+
+
+def inventories_match_baseline(
+    baseline_pairs: list[tuple[InventoryItem, InventoryItem]],
+    local_items: list[InventoryItem],
+    box_items: list[InventoryItem],
+    folder_modes: tuple[tuple[str, str], ...] = (),
+) -> bool:
+    """Compare paired inventories, ignoring derived folder summary metadata."""
+    local_items, box_items = baseline_inventories(local_items, box_items, folder_modes)
+    # Local display timestamps and content IDs are derived from mtime/device/inode
+    # by the scanner, but are not stored in paired baseline snapshots.
+    def local_key(item: InventoryItem) -> InventoryItem:
+        return replace(item, modified_at=None, content_id=None,
+                       mtime_ns=None if item.item_type == "folder" else item.mtime_ns)
+
+    def box_key(item: InventoryItem) -> InventoryItem:
+        # Folder summaries can change when excluded or upload-only Box content
+        # changes. Paths and identities still have to match; files remain exact.
+        if item.item_type == "folder":
+            return InventoryItem(item.relative_path, "folder", content_id=item.content_id)
+        return item
+
+    local = _unique([local_key(item) for item in local_items], "local")
+    remote = _unique([box_key(item) for item in box_items], "Box")
+    return (
+        local == {left.relative_path: local_key(left) for left, _ in baseline_pairs}
+        and remote == {right.relative_path: box_key(right) for _, right in baseline_pairs}
+    )
 
 
 def build_sync_plan(

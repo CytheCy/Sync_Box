@@ -114,6 +114,21 @@ class BoxMutations:
         return self.client.downloads.download_file(file_id, version=version_id)
 
 
+def complete_unchanged_sync(
+    local_root: Path, state_database: Path, *, baseline_generation: int,
+) -> None:
+    """Journal a baseline-matching scan without mutations or a new baseline."""
+    root = local_root.resolve(strict=True)
+    with _exclusive_sync_lock(state_database, root):
+        # begin_sync_run checks the current generation and interrupted resolutions
+        # under a database transaction, just as it does for an executing run.
+        run_id = begin_sync_run(
+            state_database, [], baseline_generation=baseline_generation,
+            local_root=str(root),
+        )
+        finish_sync_run(state_database, run_id, "completed", "completed=0; no changes")
+
+
 def execute_sync(
     box: BoxMutations,
     local_root: Path,

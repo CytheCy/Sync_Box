@@ -42,8 +42,12 @@ from sync_box.planner import (
 )
 from sync_box.two_way import (
     build_sync_plan, render_sync_plan, summarize_sync_plan, validate_baseline_match,
+    inventories_match_baseline,
+    baseline_inventories,
 )
-from sync_box.sync_engine import BoxMutations, SyncExecutionError, SyncRetryNeeded, execute_sync
+from sync_box.sync_engine import (
+    BoxMutations, SyncExecutionError, SyncRetryNeeded, complete_unchanged_sync, execute_sync,
+)
 from sync_box.systemd_units import (
     SystemdUnitError,
     find_invoked_executable,
@@ -345,12 +349,17 @@ def _fresh_inventories(
     *,
     local_phase: str = "Scanning local files",
     box_phase: str = "Reading Box inventory",
+    use_hash_cache: bool = False,
+    force_hashes: bool = False,
 ) -> tuple[list[object], list[object]]:
     local_arguments = {
         "hash_files": True,
         "excluded_paths": config.excluded_paths,
         "excluded_names": config.excluded_names,
     }
+    if use_hash_cache:
+        local_arguments["hash_cache_database"] = config.state_database
+        local_arguments["force_hashes"] = force_hashes
     if progress is not None:
         progress.phase(local_phase)
         local_arguments["progress"] = progress.report
@@ -404,7 +413,9 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
         if not args.dry_run and not args.initial_download_from_box
         else None
     )
-    local_items, box_items = _fresh_inventories(config, client, progress)
+    local_items, box_items = _fresh_inventories(
+        config, client, progress, use_hash_cache=progress is not None,
+    )
     if args.initial_download_from_box:
         plan = build_initial_download_plan(local_items, box_items)
         counts = summarize_initial_download(plan)
@@ -454,6 +465,7 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     generation, baseline_local_root, baseline_box_root, pairs = baseline
     if baseline_local_root != str(config.local_root) or baseline_box_root != config.box_folder_id:
         raise RuntimeError("Baseline roots do not match the current configuration")
+    baseline_pairs = pairs
     pairs = upload_recovered_pairs(config.state_database, generation, str(config.local_root), config.box_folder_id, pairs)
     plan = build_sync_plan(pairs, local_items, box_items, config.folder_modes)
     counts = summarize_sync_plan(plan)
@@ -465,6 +477,17 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     if not args.summary_only:
         print(render_sync_plan(plan, as_json=args.json, limit=args.limit))
     if not args.dry_run:
+        if not plan and inventories_match_baseline(
+            baseline_pairs, local_items, box_items, config.folder_modes,
+        ):
+            validate_baseline_match(*baseline_inventories(local_items, box_items, config.folder_modes))
+            complete_unchanged_sync(
+                config.local_root, config.state_database, baseline_generation=generation,
+            )
+            message = f"Synchronization complete; no changes; baseline generation={generation}"
+            print(message)
+            LOGGER.info(message)
+            return 0
         from sync_box.box_auth import build_write_authenticated_client
         write_client = build_write_authenticated_client(config)
         if progress is not None:
@@ -477,6 +500,7 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
                 progress,
                 local_phase="Rechecking local files",
                 box_phase="Rechecking Box inventory",
+                use_hash_cache=True,
             )
             if progress is not None:
                 progress.phase("Applying changes", total=len(plan))
@@ -496,6 +520,8 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
                 progress,
                 local_phase="Verifying local files",
                 box_phase="Verifying Box inventory",
+                use_hash_cache=True,
+                force_hashes=True,
             ),
         )
         print(

@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from sync_box.inventory import InventoryItem
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MIGRATIONS = {
     1: "schema.sql",
     2: "migrations/0002_inventory.sql",
@@ -22,6 +22,7 @@ MIGRATIONS = {
     5: "migrations/0005_sync_run_guard.sql",
     6: "migrations/0006_sync_progress.sql",
     7: "migrations/0007_upload_recovery.sql",
+    8: "migrations/0008_local_hash_cache.sql",
 }
 
 

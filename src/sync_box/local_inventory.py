@@ -1,13 +1,16 @@
-"""Read-only local filesystem inventory."""
+"""Local filesystem inventory with optional hashing cached in external state."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import logging
 import os
 from pathlib import Path
 import stat
 from typing import Callable
+
+from sync_box.hash_cache import LocalHashCache, file_fingerprint
 
 from sync_box.inventory import (
     InventoryItem,
@@ -26,6 +29,8 @@ def scan_local(
     excluded_paths: tuple[str, ...] = (),
     excluded_names: tuple[str, ...] = (),
     progress: Callable[[int], None] | None = None,
+    hash_cache_database: Path | None = None,
+    force_hashes: bool = False,
 ) -> list[InventoryItem]:
     root = root.resolve(strict=False)
     if not root.is_dir():
@@ -36,6 +41,8 @@ def scan_local(
     except OSError as exc:
         raise ScanError(f"Cannot stat local synchronization root: {root}") from exc
 
+    cache = (LocalHashCache(hash_cache_database, root, force_hashes=force_hashes)
+             if hash_files and hash_cache_database is not None else None)
     items = [_local_item(".", "folder", root_stat)]
     if progress is not None:
         progress(1)
@@ -74,16 +81,26 @@ def scan_local(
                 if isinstance(exc, FileNotFoundError):
                     raise ScanChangedError(f"Local file disappeared while scanning: {entry.path}") from exc
                 raise ScanError(f"Cannot inspect local path: {entry.path}") from exc
-            sha1 = (
-                _sha1_file(Path(entry.path), item_stat)
-                if hash_files and item_type == "file"
-                else None
-            )
+            sha1 = None
+            if hash_files and item_type == "file":
+                cached = cache.lookup(relative_path, item_stat) if cache is not None else None
+                if cached is None:
+                    sha1 = _sha1_file(Path(entry.path), item_stat)
+                else:
+                    sha1 = _sha1_file(Path(entry.path), item_stat, cached_sha1=cached.sha1)
+                if cache is not None:
+                    cache.record(relative_path, item_stat, sha1, cached)
             items.append(_local_item(relative_path, item_type, item_stat, sha1=sha1))
             if progress is not None:
                 progress(len(items))
         pending.extend(reversed(child_directories))
 
+    if cache is not None:
+        cache.save()
+        logging.getLogger("sync_box").info(
+            "Local file hashes: reused=%s, hashed=%s, forced=%s",
+            cache.hits, cache.hashed, force_hashes,
+        )
     return sorted(items, key=lambda item: item.relative_path)
 
 
@@ -110,7 +127,7 @@ def _local_item(
     )
 
 
-def _sha1_file(path: Path, expected: os.stat_result) -> str:
+def _sha1_file(path: Path, expected: os.stat_result, *, cached_sha1: str | None = None) -> str:
     """Hash a stable regular file without following a final symlink."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -121,7 +138,8 @@ def _sha1_file(path: Path, expected: os.stat_result) -> str:
                 before.st_mode
             ):
                 raise ScanChangedError(f"Local file changed while opening it: {path}")
-            digest = hashlib.file_digest(file_handle, "sha1").hexdigest()
+            digest = (cached_sha1 if cached_sha1 is not None
+                      else hashlib.file_digest(file_handle, "sha1").hexdigest())
             after = os.fstat(file_handle.fileno())
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
@@ -133,14 +151,4 @@ def _sha1_file(path: Path, expected: os.stat_result) -> str:
 
 
 def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        left.st_dev,
-        left.st_ino,
-        left.st_size,
-        left.st_mtime_ns,
-    ) == (
-        right.st_dev,
-        right.st_ino,
-        right.st_size,
-        right.st_mtime_ns,
-    )
+    return file_fingerprint(left) == file_fingerprint(right)
