@@ -27,6 +27,7 @@ class AppConfig:
     excluded_paths: tuple[str, ...]
     excluded_names: tuple[str, ...]
     folder_modes: tuple[tuple[str, str], ...] = ()
+    conflict_policy: str = "manual"
 
 
 def default_config_path() -> Path:
@@ -57,6 +58,7 @@ def load_config(path: Path) -> AppConfig:
         excluded_paths=_excluded_paths(data),
         excluded_names=_excluded_names(data),
         folder_modes=_folder_modes(data),
+        conflict_policy=_conflict_policy(data),
     )
     _validate(config, config_path)
     return config
@@ -204,6 +206,57 @@ def save_folder_mode(config_path: Path, folder: str, mode: str) -> None:
             os.fsync(handle.fileno())
         if config_path.read_text() != original:
             raise ConfigError("Configuration changed while saving. Reopen Folder Setting and retry.")
+        temporary.replace(config_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _conflict_policy(data: dict[str, Any]) -> str:
+    section = data.get("conflicts", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[conflicts] must be a table")
+    policy = section.get("policy", "manual")
+    if policy not in ("manual", "prefer_newest"):
+        raise ConfigError("[conflicts] policy must be manual or prefer_newest")
+    return policy
+
+
+def save_conflict_policy(config_path: Path, policy: str) -> None:
+    """Atomically save the conflict policy, preserving unrelated configuration."""
+    _conflict_policy({"conflicts": {"policy": policy}})
+    load_config(config_path)
+    original = config_path.read_text()
+    lines = (original.rstrip("\n") + "\n").splitlines(keepends=True)
+    result = []
+    in_section = False
+    found = False
+    for line in lines:
+        if re.match(r"^\s*\[", line):
+            if in_section and not found:
+                result.append(f'policy = "{policy}"\n')
+                found = True
+            in_section = bool(re.match(r"^\s*\[conflicts\]\s*(?:#.*)?$", line.strip()))
+        if in_section and re.match(r'^\s*(?:policy|"policy"|\'policy\')\s*=', line):
+            result.append(f'policy = "{policy}"\n')
+            found = True
+        else:
+            result.append(line)
+    if not found:
+        if not in_section:
+            result.append("\n[conflicts]\n")
+        result.append(f'policy = "{policy}"\n')
+    contents = "".join(result)
+    _conflict_policy(tomllib.loads(contents))
+    descriptor, name = tempfile.mkstemp(prefix=".conflict-settings-", dir=config_path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if config_path.read_text() != original:
+            raise ConfigError("Configuration changed while saving; reopen Settings and retry.")
         temporary.replace(config_path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -86,13 +86,15 @@ def _load(config, token):
     return result
 
 
-def preview_file_conflict(config: AppConfig, path: str, *, inventories=None, box=None):
+def preview_file_conflict(config: AppConfig, path: str, *, inventories=None, box=None, automatic=False):
     """Read both versions, create verified private backups, and return a review token."""
     _path(config.local_root, path)
     initialize_database(config.state_database)
     active = active_file_resolution(config.state_database)
     if active:
         data = json.loads(active["snapshot_json"])
+        if automatic:
+            raise FileResolutionError("Another file resolution is incomplete; resume it first")
         return _preview_result(active["token"], data, resume=True, policy=active["policy"])
     baseline = load_baseline(config.state_database)
     if baseline is None or baseline[1:3] != (str(config.local_root), config.box_folder_id):
@@ -117,6 +119,12 @@ def preview_file_conflict(config: AppConfig, path: str, *, inventories=None, box
     for item in (left, right):
         if item and (item.item_type != "file" or item.sha1 is None or item.size is None):
             raise FileResolutionError("This action supports regular file conflicts only")
+    automatic_policy = None
+    if automatic:
+        from sync_box.newest_conflicts import newer_file_policy
+        automatic_policy = newer_file_policy(conflicts[0], left, right)
+        if automatic_policy is None:
+            return None
     token = uuid.uuid4().hex
     directory = config.state_database.parent / "conflict-backups" / token
     if directory.resolve().is_relative_to(config.local_root.resolve()):
@@ -152,7 +160,7 @@ def preview_file_conflict(config: AppConfig, path: str, *, inventories=None, box
         sources[side] = {"file": str(backup), "sha1": item.sha1, "size": item.size}
     data = dict(path=path, box_path=remote_path, copy_path=copy_path,
                 local=initial_local, box=initial_box, sources=sources, backup_directory=str(directory),
-                reason=conflicts[0].reason)
+                reason=conflicts[0].reason, automatic_policy=automatic_policy)
     manifest = directory / "manifest.json"
     manifest.write_text(json.dumps(data, indent=2))
     manifest.chmod(0o600)
@@ -187,7 +195,7 @@ def _preview_result(token, data, *, resume=False, policy=None):
     return dict(token=token, path=data["path"], box_path=data["box_path"], copy_path=data["copy_path"], local_preview=texts["local"],
                 box_preview=texts["box"], diff=diff or "The content previews match.",
                 sources=data["sources"], backup_directory=data["backup_directory"],
-                resume=resume, policy=policy,
+                resume=resume, policy=policy, automatic_policy=data.get("automatic_policy"),
                 keep_both_available=not data["copy_path"] or not (
                     data["local"].get(data["copy_path"]) or data["box"].get(data["copy_path"])))
 

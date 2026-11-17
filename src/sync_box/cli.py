@@ -468,6 +468,21 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     baseline_pairs = pairs
     pairs = upload_recovered_pairs(config.state_database, generation, str(config.local_root), config.box_folder_id, pairs)
     plan = build_sync_plan(pairs, local_items, box_items, config.folder_modes)
+    if not args.dry_run and config.conflict_policy == "prefer_newest":
+        from sync_box.newest_conflicts import resolve_newer_conflicts
+        resolved = resolve_newer_conflicts(
+            config, plan, local_items, box_items,
+            inventories=lambda: _fresh_inventories(config, build_authenticated_client(config), progress),
+        )
+        if resolved:
+            for item in resolved:
+                print(f"Resolved {item['path']!r}: {item['policy']}; backups: {item['backup_directory']}")
+            local_items, box_items = _fresh_inventories(config, build_authenticated_client(config), progress)
+            generation, baseline_local_root, baseline_box_root, baseline_pairs = load_baseline(config.state_database)
+            if baseline_local_root != str(config.local_root) or baseline_box_root != config.box_folder_id:
+                raise RuntimeError("Baseline roots changed during conflict resolution")
+            pairs = upload_recovered_pairs(config.state_database, generation, str(config.local_root), config.box_folder_id, baseline_pairs)
+            plan = build_sync_plan(pairs, local_items, box_items, config.folder_modes)
     counts = summarize_sync_plan(plan)
     mode = "dry-run plan" if args.dry_run else "execution plan"
     print(

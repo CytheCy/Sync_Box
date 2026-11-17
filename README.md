@@ -281,7 +281,9 @@ After reviewing a conflict-free plan, execution is explicit:
 sync-box run
 ```
 
-Execution rejects any plan containing a conflict before changing either tree.
+By default, execution rejects any plan containing a conflict before changing either tree.
+With the optional newest-file policy below, eligible conflicts are resolved first;
+remaining conflicts still block ordinary synchronization.
 When the first fresh inventories match the paired baseline and the plan
 is empty, the run records success without obtaining a write token, rescanning,
 or replacing the baseline.
@@ -389,6 +391,27 @@ quiet seconds before rescanning, with at most three passes per invocation. If th
 tree remains busy for a minute or the passes are exhausted, the GUI shows **Sync
 pending** and queues another attempt; a headless installation tries again on its
 next scheduled run. Confirmed upload receipts survive every retry and restart.
+
+In **Settings → File conflicts**, choose **Prefer last modified, back up the other
+version** to automatically resolve ordinary files edited differently on both
+sides. The equivalent configuration is:
+
+```toml
+[conflicts]
+policy = "prefer_newest" # Default: "manual"
+```
+
+This compares last modification times, not creation times. Both versions are
+verified and backed up in `conflict-backups/<token>/` beside the state database
+before the chosen version replaces the other. The manifest records the path,
+timestamps, and automatic choice; the run output and log include the backup
+location. Backups remain until you remove them. Missing, invalid, or timezone-less
+timestamps and times within the same second require manual review, as do moves,
+deletions, replaced identities, and filename collisions. Clock differences or
+copied timestamps can affect which version wins. Dry runs continue to show
+conflicts without creating backups or changing files. Interrupted automatic
+resolutions resume their saved choice on the next run while this policy is
+enabled; manual choices still require review in the conflict dialog.
 
 Click **Resolve Conflict…** to view the current Local and Box versions, their
 sizes and hashes, and a text diff. Text previews are limited to 64 KiB per side;

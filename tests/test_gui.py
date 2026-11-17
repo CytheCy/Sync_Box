@@ -196,6 +196,30 @@ class GuiBehaviorTests(unittest.TestCase):
         dialog.deleteLater()
         window.deleteLater()
 
+    def test_conflict_policy_setting_loads_and_saves(self):
+        from dataclasses import replace
+        from sync_box.config import load_config, save_conflict_policy
+        from sync_box.setup_config import create_initial_config
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "local"
+            root.mkdir()
+            path = base / "config.toml"
+            create_initial_config(root, config_path=path, state_directory=base / "state")
+            save_conflict_policy(path, "prefer_newest")
+            window, provider = self.make_window()
+            provider.config_path = path
+            window.snapshot = replace(window.snapshot, config=load_config(path))
+            dialog = SettingsDialog(window)
+            self.assertEqual(dialog.conflict_policy.currentData(), "prefer_newest")
+            dialog.conflict_policy.setCurrentIndex(dialog.conflict_policy.findData("manual"))
+            with patch("sync_box.gui.set_autostart"), patch("sync_box.gui.save_preferences"), \
+                 patch.object(window, "update_watcher"), patch.object(window, "refresh_status"):
+                dialog._save()
+            self.assertEqual(load_config(path).conflict_policy, "manual")
+            dialog.deleteLater()
+            window.deleteLater()
+
     def test_conflict_card_shows_path_reason_and_resolution(self) -> None:
         window, provider = self.make_window()
         conflict = ConflictDetail(

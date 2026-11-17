@@ -33,7 +33,7 @@ from sync_box.app_status import (
 )
 from sync_box.autostart import autostart_enabled, set_autostart
 from sync_box.box_errors import safe_error_detail
-from sync_box.config import ConfigError, default_config_path, load_config, folder_mode, save_folder_mode
+from sync_box.config import ConfigError, default_config_path, load_config, folder_mode, save_folder_mode, save_conflict_policy
 from sync_box.inventory import is_excluded_path
 from sync_box.logging_setup import configure_logging, log_failure
 from sync_box.resources import cli_command, icon_path
@@ -439,6 +439,13 @@ class SettingsDialog(QDialog):
             self.schedule.addItem(label, minutes)
         self.schedule.setCurrentIndex(INTERVALS.index(window.preferences.interval))
         form.addRow("Schedule", self.schedule)
+        self.conflict_policy = QComboBox()
+        self.conflict_policy.addItem("Review conflicts manually", "manual")
+        self.conflict_policy.addItem("Prefer last modified, back up the other version", "prefer_newest")
+        config = window.snapshot.config
+        self.conflict_policy.setCurrentIndex(self.conflict_policy.findData(config.conflict_policy if config else "manual"))
+        self.conflict_policy.setToolTip("Applies to files edited on both sides. Ties, missing timestamps, moves, and deletions require review. Backups are retained outside the synced folder.")
+        form.addRow("File conflicts", self.conflict_policy)
         self.account = QLabel("Checking…")
         form.addRow("Box connection", self.account)
         layout.addLayout(form)
@@ -515,6 +522,8 @@ class SettingsDialog(QDialog):
                     self.box_url.text(),
                     config_path=self.window.provider.config_path,
                 )
+            if load_config(self.window.provider.config_path).conflict_policy != self.conflict_policy.currentData():
+                save_conflict_policy(self.window.provider.config_path, self.conflict_policy.currentData())
             if self.timer.isEnabled() and self.timer.isChecked() != self.window.snapshot.systemd.timer_enabled:
                 ok, message = self.window.provider.controller.set_timer_enabled(self.timer.isChecked())
                 if not ok:
@@ -526,7 +535,7 @@ class SettingsDialog(QDialog):
             save_preferences(preferences)
             self.window.preferences = preferences
             self.window.update_watcher()
-        except (OSError, SetupError, SystemdUnitError) as exc:
+        except (OSError, ConfigError, SetupError, SystemdUnitError) as exc:
             QMessageBox.warning(self, "Settings not saved", str(exc))
             return
         self.window.refresh_status()
@@ -1083,7 +1092,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.folder_settings_button)
         layout.addSpacing(8)
 
-        layout.addWidget(_section("BOX"))
+        box_header = QHBoxLayout()
+        box_header.addWidget(_section("BOX"))
+        box_header.addStretch()
+        self.open_box_button = QPushButton("Open Box Online")
+        self.open_box_button.setToolTip("Open your Box files in the default browser")
+        self.open_box_button.clicked.connect(self.open_box_online)
+        box_header.addWidget(self.open_box_button)
+        layout.addLayout(box_header)
         self.connection = QLabel("Checking connection…")
         self.storage = QLabel("Checking storage usage…")
         self.storage.setObjectName("secondary")
@@ -1400,6 +1416,10 @@ class MainWindow(QMainWindow):
         self.refresh_status()
         if self._login_pending or self._dirty:
             self.debounce.start(1000)
+
+    def open_box_online(self) -> None:
+        if not QDesktopServices.openUrl(QUrl("https://app.box.com/")):
+            QMessageBox.warning(self, "Browser unavailable", "Could not open Box in your browser.")
 
     def open_folder(self) -> None:
         folder = validated_local_folder(self.snapshot.config)
