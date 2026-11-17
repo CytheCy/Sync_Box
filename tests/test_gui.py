@@ -106,6 +106,29 @@ class GuiBehaviorTests(unittest.TestCase):
         window.tray.hide()
         window.deleteLater()
 
+    def test_history_labels_deletion_targets_and_counts_only_completed_operations(self):
+        window, _provider = self.make_window()
+        rows = [
+            ('2026-11-16T12:00:00Z', action, f'file-{i}', status)
+            for i, (action, status) in enumerate([
+                ('upload_new', 'completed'), ('download_new', 'completed'),
+                ('delete_box', 'completed'), ('delete_local', 'completed'),
+                ('delete_box', 'failed'), ('delete_box', 'pending'),
+            ])
+        ]
+        window._history_finished(rows, None)
+        self.assertEqual(window.history.horizontalHeaderItem(1).text(), 'Action')
+        self.assertEqual(window.history.item(2, 1).text(), 'Delete from Box')
+        self.assertEqual(window.history.item(3, 1).text(), 'Delete locally')
+        self.assertEqual(window.history.item(4, 3).text(), 'Failed')
+        self.assertEqual(window.history.item(5, 3).text(), 'Pending')
+        self.assertEqual(window.history_summary.text(),
+                         '↑ 1 uploads   ↓ 1 downloads   Deleted: 1 from Box, 1 locally')
+        window._history_finished([], None)
+        self.assertEqual(window.history.rowCount(), 0)
+        self.assertIn('No transfers or deletions', window.history_summary.text())
+        window.deleteLater()
+
     def test_tray_has_icon_before_becoming_visible(self) -> None:
         icons_at_show = []
 

@@ -1,4 +1,4 @@
-"""Desktop preferences, systemd scheduling, and read-only transfer history."""
+"""Desktop preferences, systemd scheduling, and read-only sync history."""
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -75,7 +75,7 @@ def set_sync_interval(minutes: int, *, enabled: bool) -> None:
 
 
 def transfer_history(path: Path) -> list[tuple[str, str, str, str]]:
-    """Use journaled operations, including transfers in partially failed runs.
+    """Use journaled transfers and deletions, including partially failed runs.
 
     The existing journal dates runs rather than individual operations; use the
     run's finish time, or start time while it is in progress.
@@ -86,7 +86,8 @@ def transfer_history(path: Path) -> list[tuple[str, str, str, str]]:
         return db.execute(
             "SELECT coalesce(r.finished_at,r.started_at), o.action, o.relative_path, o.status "
             "FROM sync_operations o JOIN sync_runs r ON r.id=o.run_id "
-            "WHERE r.dry_run=0 AND (o.action LIKE 'upload_%' OR o.action LIKE 'download_%') "
+            "WHERE r.dry_run=0 AND (o.action LIKE 'upload_%' OR o.action LIKE 'download_%' "
+            "OR o.action IN ('delete_box', 'delete_local')) "
             "AND julianday(coalesce(r.finished_at,r.started_at)) >= julianday('now','-48 hours') "
             "ORDER BY r.id DESC, o.id DESC"
         ).fetchall()

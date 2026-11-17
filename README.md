@@ -33,9 +33,11 @@ Settings are saved in `[folder_modes]` in `config.toml` and apply to subsequent
 GUI and scheduled/CLI sync runs. Saving a setting does not start a sync.
 
 Preferences live in `~/.config/sync-box/desktop.json`. Schedule changes use a
-user timer drop-in and preserve the installed service. Transfer history reads
-the engine's durable operation journal, including failed and pending transfers;
-its times refer to the containing sync run. Empty/no-change runs are not transfers.
+user timer drop-in and preserve the installed service. Sync activity reads
+the engine's durable operation journal, including failed and pending transfers
+and deletions. Deletion rows identify whether the target is Box or the local
+folder; summary counts include only completed operations. Activity times refer
+to the containing sync run. Empty/no-change runs have no activity rows.
 Authentication and baseline verification remain required for automatic syncing.
 Install the GUI dependencies for a development checkout with
 `.venv/bin/pip install -e '.[gui]'`.

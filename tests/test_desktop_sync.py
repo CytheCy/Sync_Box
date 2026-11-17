@@ -49,7 +49,29 @@ class DesktopSyncTests(unittest.TestCase):
                     INSERT INTO sync_operations VALUES(1,1,'upload_new','old','completed'),(2,2,'download_new','new','completed'),(3,2,'upload_version','failed','failed'),(4,3,'upload_new','dry','completed'),(5,2,'delete_local','deleted','completed');
                 ''')
             rows = transfer_history(path)
-            self.assertEqual({row[2] for row in rows}, {'new', 'failed'})
+            self.assertEqual({row[2] for row in rows}, {'new', 'failed', 'deleted'})
+
+    def test_history_includes_deletion_statuses_but_excludes_old_and_dry_deletions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            with sqlite3.connect(path) as db:
+                db.executescript('''
+                    CREATE TABLE sync_runs(id INTEGER, started_at TEXT, finished_at TEXT, dry_run INTEGER);
+                    CREATE TABLE sync_operations(id INTEGER,run_id INTEGER,action TEXT,relative_path TEXT,status TEXT);
+                    INSERT INTO sync_runs VALUES(1,datetime('now','-49 hours'),NULL,0),(2,datetime('now'),NULL,0),(3,datetime('now'),NULL,1);
+                    INSERT INTO sync_operations VALUES
+                        (1,1,'delete_box','old','completed'),
+                        (2,2,'delete_box','remote','completed'),
+                        (3,2,'delete_box','failed','failed'),
+                        (4,2,'delete_local','pending','pending'),
+                        (5,3,'delete_box','dry','completed');
+                ''')
+            rows = transfer_history(path)
+            self.assertEqual([(r[1], r[2], r[3]) for r in rows], [
+                ('delete_local', 'pending', 'pending'),
+                ('delete_box', 'failed', 'failed'),
+                ('delete_box', 'remote', 'completed'),
+            ])
 
     def test_recursive_watcher_detects_edits_but_ignores_reads(self):
         try:

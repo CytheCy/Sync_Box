@@ -1100,15 +1100,15 @@ class MainWindow(QMainWindow):
         self.watch_status.setObjectName("secondary")
         layout.addWidget(self.watch_status)
         layout.addSpacing(12)
-        layout.addWidget(_section("TRANSFER ACTIVITY · LAST 48 HOURS"))
-        self.history_summary = QLabel("Loading transfer history…")
+        layout.addWidget(_section("SYNC ACTIVITY · LAST 48 HOURS"))
+        self.history_summary = QLabel("Loading sync history…")
         self.history_summary.setObjectName("secondary")
         layout.addWidget(self.history_summary)
         self.history = QTableWidget(0, 4)
-        self.history.setHorizontalHeaderLabels(["Time", "Direction", "File", "Status"])
+        self.history.setHorizontalHeaderLabels(["Time", "Action", "File", "Status"])
         self.history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.history.setColumnWidth(0, 175)
-        self.history.setColumnWidth(1, 100)
+        self.history.setColumnWidth(1, 145)
         self.history.verticalHeader().hide()
         self.history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1297,11 +1297,17 @@ class MainWindow(QMainWindow):
     def _history_finished(self, rows, error) -> None:
         self._history_task = None
         if error:
-            self.history_summary.setText("Transfer history temporarily unavailable")
+            self.history_summary.setText("Sync history temporarily unavailable")
             return
         completed = [row for row in rows if row[3] == "completed"]
         uploads = sum(row[1].startswith("upload") for row in completed)
-        self.history_summary.setText(f"↑ {uploads:,} uploads   ↓ {len(completed) - uploads:,} downloads" if rows else "No uploads or downloads in the last 48 hours")
+        downloads = sum(row[1].startswith("download") for row in completed)
+        box_deletions = sum(row[1] == "delete_box" for row in completed)
+        local_deletions = sum(row[1] == "delete_local" for row in completed)
+        summary = f"↑ {uploads:,} uploads   ↓ {downloads:,} downloads"
+        if box_deletions or local_deletions:
+            summary += f"   Deleted: {box_deletions:,} from Box, {local_deletions:,} locally"
+        self.history_summary.setText(summary if rows else "No transfers or deletions in the last 48 hours")
         if rows == self._history_rows:
             return
         self._history_rows = rows
@@ -1312,8 +1318,11 @@ class MainWindow(QMainWindow):
             if parsed.tzinfo is None:
                 from datetime import timezone
                 parsed = parsed.replace(tzinfo=timezone.utc)
+            label = {"delete_box": "Delete from Box", "delete_local": "Delete locally"}.get(action)
+            if label is None:
+                label = "↑ Upload" if action.startswith("upload") else "↓ Download"
             values = (parsed.astimezone().strftime("%b %d, %I:%M %p"),
-                      "↑ Upload" if action.startswith("upload") else "↓ Download", path, status.capitalize())
+                      label, path, status.capitalize())
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
