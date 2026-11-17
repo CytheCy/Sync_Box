@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import json
+import re
+import tempfile
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -23,6 +26,7 @@ class AppConfig:
     log_file: Path
     excluded_paths: tuple[str, ...]
     excluded_names: tuple[str, ...]
+    folder_modes: tuple[tuple[str, str], ...] = ()
 
 
 def default_config_path() -> Path:
@@ -52,6 +56,7 @@ def load_config(path: Path) -> AppConfig:
         log_file=_absolute_path(data, "storage", "log_file"),
         excluded_paths=_excluded_paths(data),
         excluded_names=_excluded_names(data),
+        folder_modes=_folder_modes(data),
     )
     _validate(config, config_path)
     return config
@@ -146,3 +151,59 @@ def _find_git_root(start: Path) -> Path | None:
         if (candidate / ".git").exists():
             return candidate
     return None
+
+
+def _folder_modes(data: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    values = data.get("folder_modes", {})
+    if not isinstance(values, dict):
+        raise ConfigError("[folder_modes] must be a table")
+    result = []
+    for path, mode in values.items():
+        try:
+            normalized = "." if path == "." else normalize_relative_path(tuple(path.split("/")))
+        except ScanError as exc:
+            raise ConfigError(f"Invalid folder setting {path!r}: {exc}") from exc
+        if normalized != path or mode not in ("one-way", "two-way"):
+            raise ConfigError(f"Invalid folder setting {path!r}; use one-way or two-way")
+        result.append((path, mode))
+    return tuple(sorted(result))
+
+
+def folder_mode(path: str, modes: tuple[tuple[str, str], ...] = ()) -> str:
+    matches = [(root, mode) for root, mode in modes
+               if root == "." or path == root or path.startswith(root + "/")]
+    return max(matches, key=lambda pair: len(pair[0]))[1] if matches else "two-way"
+
+
+def save_folder_mode(config_path: Path, folder: str, mode: str) -> None:
+    """Atomically update folder directions while preserving other configuration."""
+    config = load_config(config_path)
+    modes = dict(config.folder_modes)
+    modes[folder] = mode
+    validated = _folder_modes({"folder_modes": modes})
+    original = config_path.read_text()
+    lines = original.splitlines(keepends=True)
+    kept = []
+    in_modes = False
+    for line in lines:
+        if re.match(r"^\s*\[", line):
+            in_modes = bool(re.match(r"^\s*\[folder_modes\]\s*(?:#.*)?$", line.strip()))
+        if not in_modes:
+            kept.append(line)
+    contents = "".join(kept).rstrip() + "\n\n[folder_modes]\n"
+    contents += "".join(f"{json.dumps(path, ensure_ascii=False)} = {json.dumps(value)}\n"
+                        for path, value in validated)
+    _folder_modes(tomllib.loads(contents))
+    descriptor, name = tempfile.mkstemp(prefix=".folder-settings-", dir=config_path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if config_path.read_text() != original:
+            raise ConfigError("Configuration changed while saving. Reopen Folder Setting and retry.")
+        temporary.replace(config_path)
+    finally:
+        temporary.unlink(missing_ok=True)

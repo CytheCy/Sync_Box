@@ -277,6 +277,10 @@ class StatusProvider:
             systemd.service.result not in {"", "success"}
             or systemd.service.exec_status != 0
         )
+        if (database.latest_summary or "").startswith("retry:"):
+            return StatusSnapshot(StatusKind.ATTENTION, "Sync pending",
+                "Files changed during sync. Completed uploads are saved; waiting to retry.",
+                config, systemd, database, account, auth_state)
         if database.latest_outcome == "failed" or service_failed:
             kind = (
                 StatusKind.CONFLICT
@@ -311,6 +315,7 @@ def read_database_state(path: Path) -> DatabaseState:
     if not path.is_file():
         return DatabaseState()
     sync_progress = None
+    file_resolution = None
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
             baseline = connection.execute(
@@ -334,6 +339,12 @@ def read_database_state(path: Path) -> DatabaseState:
                 "SELECT 1 FROM conflict_resolution_runs "
                 "WHERE outcome='in_progress' LIMIT 1"
             ).fetchone()
+            try:
+                file_resolution = connection.execute(
+                    "SELECT original_path, policy FROM file_resolutions WHERE outcome='in_progress' LIMIT 1").fetchone()
+                resolution = resolution or file_resolution
+            except sqlite3.OperationalError:
+                pass
             unresolved = connection.execute(
                 "SELECT 1 FROM conflicts WHERE resolved_at IS NULL LIMIT 1"
             ).fetchone()
@@ -356,7 +367,7 @@ def read_database_state(path: Path) -> DatabaseState:
         return DatabaseState()
 
     plan_conflicts: tuple[ConflictDetail, ...] = ()
-    if latest and latest[3]:
+    if latest and latest[3] and not (latest[2] or "").startswith("retry:"):
         try:
             plan_conflicts = tuple(
                 ConflictDetail(
@@ -368,6 +379,8 @@ def read_database_state(path: Path) -> DatabaseState:
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
+    if file_resolution and not any(c.relative_path == file_resolution[0] for c in plan_conflicts):
+        plan_conflicts += (ConflictDetail(str(file_resolution[0]), "Interrupted resolution; resume the saved choice"),)
     return DatabaseState(
         has_baseline=baseline is not None,
         item_count=count,

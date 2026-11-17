@@ -23,17 +23,25 @@ from sync_box.box_errors import (
     matching_upload_conflict,
 )
 from sync_box.database import (
+    active_file_resolution,
+    record_upload_receipt,
     begin_sync_run,
     finish_sync_run,
     load_incomplete_resolution,
     mark_operation,
     replace_baseline,
 )
-from sync_box.inventory import InventoryItem, ScanError, normalize_relative_path
-from sync_box.two_way import SyncAction, validate_baseline_match
+from sync_box.inventory import InventoryItem, ScanError, ScanChangedError, normalize_relative_path
+from sync_box.two_way import SyncAction, validate_baseline_match, baseline_inventories
 
 
 class SyncExecutionError(RuntimeError):
+    pass
+
+
+class SyncRetryNeeded(SyncExecutionError):
+    """The trees changed during a pass; rescan instead of declaring a conflict."""
+
     pass
 
 
@@ -51,18 +59,35 @@ class BoxMutations:
         self.client = client
         self.root_folder_id = root_folder_id
 
-    def upload_new(self, parent_id: str, name: str, source: Any, sha1: str) -> None:
+    def upload_new(self, parent_id: str, name: str, source: Any, sha1: str) -> InventoryItem:
         from box_sdk_gen.managers.uploads import UploadFileAttributes, UploadFileAttributesParentField
         attributes = UploadFileAttributes(name=name, parent=UploadFileAttributesParentField(id=parent_id))
-        self.client.uploads.upload_file(attributes, source, file_file_name=name,
+        result = self.client.uploads.upload_file(attributes, source, file_file_name=name,
                                         content_md_5=sha1)
+        return self._upload_result(result)
 
-    def upload_version(self, file_id: str, name: str, source: Any, etag: str | None, sha1: str) -> None:
+    def upload_version(self, file_id: str, name: str, source: Any, etag: str | None, sha1: str) -> InventoryItem:
         from box_sdk_gen.managers.uploads import UploadFileVersionAttributes
         attributes = UploadFileVersionAttributes(name=name)
-        self.client.uploads.upload_file_version(file_id, attributes, source,
+        result = self.client.uploads.upload_file_version(file_id, attributes, source,
                                                 file_file_name=name, if_match=etag,
                                                 content_md_5=sha1)
+        return self._upload_result(result)
+
+    @staticmethod
+    def _upload_result(result: Any) -> InventoryItem:
+        entries = getattr(result, "entries", None)
+        if not isinstance(entries, (list, tuple)) or len(entries) != 1:
+            raise SyncExecutionError("Box did not return exactly one uploaded file")
+        item = entries[0]
+        version = getattr(getattr(item, "file_version", None), "id", None)
+        # SDK 10.x maps the API's "sha1" field to the Python attribute "sha_1".
+        sha1 = getattr(item, "sha_1", None)
+        if not (getattr(item, "id", None) and version and sha1
+                and getattr(item, "size", None) is not None and getattr(item, "etag", None) is not None):
+            raise SyncExecutionError("Box upload acknowledgement is missing its identity or fingerprint")
+        return InventoryItem(".", "file", size=item.size, sha1=sha1,
+            content_id=str(item.id), version_id=str(version) if version else None, etag=item.etag)
 
     def create_folder(self, parent_id: str, name: str) -> str:
         from box_sdk_gen.managers.folders import CreateFolderParent
@@ -96,6 +121,7 @@ def execute_sync(
     plan: list[SyncAction],
     *,
     baseline_generation: int,
+    folder_modes: tuple[tuple[str, str], ...] = (),
     box_items_by_path: dict[str, Any],
     refresh_box: Callable[[], BoxMutations] | None = None,
     revalidate_plan: Callable[[], list[SyncAction]] | None = None,
@@ -106,6 +132,8 @@ def execute_sync(
     if root.is_symlink() or not root.is_dir():
         raise SyncExecutionError(f"Unsafe local root: {root}")
     with _exclusive_sync_lock(state_database, root):
+        if active_file_resolution(state_database):
+            raise SyncExecutionError("An interrupted file resolution must be resumed in Resolve Conflict")
         incomplete = load_incomplete_resolution(state_database)
         if incomplete is not None:
             raise SyncExecutionError(
@@ -117,7 +145,10 @@ def execute_sync(
             if [item.to_dict() for item in refreshed_plan] != [
                 item.to_dict() for item in plan
             ]:
-                raise SyncExecutionError(
+                retry_run = begin_sync_run(state_database, refreshed_plan,
+                    baseline_generation=baseline_generation, local_root=str(root))
+                finish_sync_run(state_database, retry_run, "failed", "retry: plan changed during preflight")
+                raise SyncRetryNeeded(
                     "Synchronization plan changed during locked preflight"
                 )
         _preflight_paths(root, plan)
@@ -144,7 +175,8 @@ def execute_sync(
                 try:
                     current_box = _execute_one(current_box, root, action, box_items_by_path,
                                                refresh_box=refresh_box,
-                                               reconciled_box_items=reconciled_box_items)
+                                               reconciled_box_items=reconciled_box_items,
+                                               receipt_context=(state_database, baseline_generation))
                 except Exception as exc:
                     mark_operation(state_database, run_id, action.relative_path, action.action,
                                    "failed", str(exc))
@@ -153,11 +185,20 @@ def execute_sync(
                 completed += 1
             new_generation = None
             if verify_inventories is not None:
-                verified_local, verified_box = verify_inventories()
+                try:
+                    verified_local, verified_box = verify_inventories()
+                except ScanChangedError as exc:
+                    raise SyncRetryNeeded("Local files changed while verifying; rescan required") from exc
                 verified_box = _include_reconciled_box_items(
                     verified_box, reconciled_box_items
                 )
-                validate_baseline_match(verified_local, verified_box)
+                verified_local, verified_box = baseline_inventories(
+                    verified_local, verified_box, folder_modes
+                )
+                try:
+                    validate_baseline_match(verified_local, verified_box)
+                except ScanError as exc:
+                    raise SyncRetryNeeded("Files changed during final verification; rescan required") from exc
                 new_generation = replace_baseline(
                     state_database,
                     local_root=str(root),
@@ -168,7 +209,8 @@ def execute_sync(
                     active_sync_run_id=run_id,
                 )
         except Exception as exc:
-            finish_sync_run(state_database, run_id, "failed", f"completed={completed}")
+            summary = f"retry: completed={completed}; files changed during verification" if isinstance(exc, SyncRetryNeeded) else f"completed={completed}"
+            finish_sync_run(state_database, run_id, "failed", summary)
             if isinstance(exc, SyncExecutionError):
                 raise
             raise SyncExecutionError(f"Synchronization stopped: {exc}") from exc
@@ -178,17 +220,20 @@ def execute_sync(
 
 def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
                  box_items: dict[str, Any], *, refresh_box: Callable[[], BoxMutations] | None,
-                 reconciled_box_items: dict[str, InventoryItem] | None = None) -> BoxMutations:
+                 reconciled_box_items: dict[str, InventoryItem] | None = None,
+                 receipt_context: tuple[Path, int] | None = None) -> BoxMutations:
     path = _path(root, action.relative_path)
     if action.action in {"upload_new", "upload_version"}:
         _safe_parent(root, path.parent, action.relative_path)
         parent_id = _parent_box_id(action.relative_path, box_items, box.root_folder_id)
         with _open_verified(path, action.sha1) as source:
+            source_stat = os.fstat(source.fileno())
+            uploaded = None
             try:
                 if action.action == "upload_new":
-                    box.upload_new(parent_id, path.name, source, action.sha1 or "")
+                    uploaded = box.upload_new(parent_id, path.name, source, action.sha1 or "")
                 else:
-                    box.upload_version(_required(action.box_item_id), path.name, source,
+                    uploaded = box.upload_version(_required(action.box_item_id), path.name, source,
                                        action.box_etag, action.sha1 or "")
             except Exception as exc:
                 conflict = (
@@ -208,6 +253,7 @@ def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
                         etag=conflict.etag,
                         sha1=conflict.sha1,
                     )
+                    uploaded = item
                     box_items[action.relative_path] = item
                     if reconciled_box_items is not None:
                         reconciled_box_items[action.relative_path] = item
@@ -216,9 +262,9 @@ def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
                     source.seek(0)
                     try:
                         if action.action == "upload_new":
-                            box.upload_new(parent_id, path.name, source, action.sha1 or "")
+                            uploaded = box.upload_new(parent_id, path.name, source, action.sha1 or "")
                         else:
-                            box.upload_version(_required(action.box_item_id), path.name, source,
+                            uploaded = box.upload_version(_required(action.box_item_id), path.name, source,
                                                action.box_etag, action.sha1 or "")
                     except Exception as retry_exc:
                         raise SyncExecutionError(
@@ -227,6 +273,15 @@ def _execute_one(box: BoxMutations, root: Path, action: SyncAction,
                         ) from retry_exc
                 else:
                     raise SyncExecutionError(f"Box upload failed for {action.relative_path!r}: {format_box_api_error(exc)}") from exc
+            if receipt_context and isinstance(uploaded, InventoryItem):
+                from dataclasses import replace
+                uploaded = replace(uploaded, relative_path=action.relative_path)
+                local = InventoryItem(action.relative_path, "file", size=source_stat.st_size,
+                    sha1=action.sha1, device=source_stat.st_dev, inode=source_stat.st_ino,
+                    mtime_ns=source_stat.st_mtime_ns, mode=stat.S_IMODE(source_stat.st_mode))
+                record_upload_receipt(receipt_context[0], receipt_context[1], str(root),
+                                      box.root_folder_id, local, uploaded)
+                box_items[action.relative_path] = uploaded
     elif action.action == "create_box_folder":
         _verify_folder_action(root, action)
         parent_id = _parent_box_id(action.relative_path, box_items, box.root_folder_id)

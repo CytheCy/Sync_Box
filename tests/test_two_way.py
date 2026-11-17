@@ -164,15 +164,42 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual((self.root / "new").read_bytes(), content)
 
     def test_box_adapter_sends_sha1_hex_as_content_md5(self) -> None:
+        from box_sdk_gen.schemas.file_full import FileFull
+        from box_sdk_gen.schemas.file_version_mini import FileVersionMini
+        from box_sdk_gen.schemas.files import Files
+
         uploads = Mock()
         adapter = BoxMutations(SimpleNamespace(uploads=uploads), "0")
         source = BytesIO(b"content")
         digest = sha(b"content")
 
-        adapter.upload_new("0", "file.txt", source, digest)
+        response = Files(entries=[FileFull(id="uploaded", size=7, sha_1=digest,
+            file_version=FileVersionMini(id="version"), etag="0")])
+        adapter.client.uploads.upload_file.return_value = response
+        adapter.client.uploads.upload_file_version.return_value = response
+        uploaded = adapter.upload_new("0", "file.txt", source, digest)
+        version = adapter.upload_version("uploaded", "file.txt", source, "0", digest)
+
+        for item in (uploaded, version):
+            self.assertEqual(item.sha1, digest)
+            self.assertEqual(item.content_id, "uploaded")
+            self.assertEqual(item.version_id, "version")
+            self.assertEqual(item.size, 7)
+            self.assertEqual(item.etag, "0")
 
         self.assertEqual(source.tell(), 0)
         self.assertEqual(uploads.upload_file.call_args.kwargs["content_md_5"], digest)
+        self.assertEqual(uploads.upload_file_version.call_args.kwargs["content_md_5"], digest)
+
+    def test_box_adapter_rejects_upload_acknowledgement_without_hash(self) -> None:
+        from box_sdk_gen.schemas.file_full import FileFull
+        from box_sdk_gen.schemas.file_version_mini import FileVersionMini
+        from box_sdk_gen.schemas.files import Files
+
+        response = Files(entries=[FileFull(id="uploaded", size=0,
+            file_version=FileVersionMini(id="version"), etag="0")])
+        with self.assertRaisesRegex(SyncExecutionError, "missing its identity or fingerprint"):
+            BoxMutations._upload_result(response)
 
     def test_conflict_preflight_journals_without_content_changes(self) -> None:
         action = self._conflict()

@@ -12,6 +12,7 @@ from typing import Callable
 from sync_box.inventory import (
     InventoryItem,
     ScanError,
+    ScanChangedError,
     ensure_unique_path,
     is_excluded_path,
     normalize_relative_path,
@@ -46,6 +47,8 @@ def scan_local(
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
         except OSError as exc:
+            if directory != root and isinstance(exc, FileNotFoundError):
+                raise ScanChangedError(f"Local directory disappeared while scanning: {directory}") from exc
             raise ScanError(f"Cannot read local directory: {directory}") from exc
 
         child_directories: list[tuple[Path, tuple[str, ...]]] = []
@@ -68,6 +71,8 @@ def scan_local(
                 else:
                     item_type = "other"
             except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    raise ScanChangedError(f"Local file disappeared while scanning: {entry.path}") from exc
                 raise ScanError(f"Cannot inspect local path: {entry.path}") from exc
             sha1 = (
                 _sha1_file(Path(entry.path), item_stat)
@@ -115,13 +120,15 @@ def _sha1_file(path: Path, expected: os.stat_result) -> str:
             if not _same_file_version(expected, before) or not stat.S_ISREG(
                 before.st_mode
             ):
-                raise ScanError(f"Local file changed while opening it: {path}")
+                raise ScanChangedError(f"Local file changed while opening it: {path}")
             digest = hashlib.file_digest(file_handle, "sha1").hexdigest()
             after = os.fstat(file_handle.fileno())
     except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            raise ScanChangedError(f"Local file disappeared while hashing: {path}") from exc
         raise ScanError(f"Cannot hash local file: {path}") from exc
     if not _same_file_version(before, after):
-        raise ScanError(f"Local file changed while hashing it: {path}")
+        raise ScanChangedError(f"Local file changed while hashing it: {path}")
     return digest
 
 

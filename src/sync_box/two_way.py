@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import json
 
 from sync_box.inventory import InventoryItem, ScanError
+from sync_box.config import folder_mode
 
 
 SYNCABLE = {"file", "folder"}
@@ -65,8 +66,44 @@ def build_sync_plan(
     baseline_pairs: list[tuple[InventoryItem, InventoryItem]],
     local_items: list[InventoryItem],
     box_items: list[InventoryItem],
+    folder_modes: tuple[tuple[str, str], ...] = (),
 ) -> list[SyncAction]:
     """Build actions by comparing both fresh inventories with one baseline."""
+    if folder_modes:
+        def is_one_way(path: str) -> bool:
+            return folder_mode(path, folder_modes) == "one-way"
+
+        _unique(local_items, "local")
+        _unique(box_items, "Box")
+        remote_by_id = {item.content_id: item for item in box_items if item.content_id}
+        if len(remote_by_id) != sum(bool(item.content_id) for item in box_items):
+            raise ScanError("Duplicate Box item ID in inventory")
+        boundary_conflicts = []
+        blocked_paths = set()
+        for old_local, old_box in baseline_pairs:
+            current = remote_by_id.get(old_box.content_id)
+            if current and is_one_way(old_local.relative_path) != is_one_way(current.relative_path):
+                blocked_paths.update((old_local.relative_path, current.relative_path))
+                boundary_conflicts.append(_conflict(old_local.relative_path, current,
+                    "Box move crosses folders with different sync directions"))
+        normal = build_sync_plan(
+            [(left, right) for left, right in baseline_pairs if not is_one_way(left.relative_path)],
+            [item for item in local_items if not is_one_way(item.relative_path)],
+            [item for item in box_items if not is_one_way(item.relative_path)],
+        )
+        # A recursive operation on a parent must not bypass a child's direction.
+        for index, action in enumerate(normal):
+            if action.item_type == "folder" and action.action in {"delete_box", "delete_local", "move_box", "move_local"}:
+                if any(mode == "one-way" and any(root.startswith(parent + "/")
+                           for parent in (action.relative_path, action.destination_path) if parent)
+                       for root, mode in folder_modes):
+                    normal[index] = _conflict(action.relative_path, None,
+                        "parent move/deletion crosses a one-way folder setting")
+        actions = normal + _one_way_plan(local_items, box_items, folder_modes)
+        actions = [action for action in actions if not any(
+            action.relative_path == path or action.relative_path.startswith(path + "/")
+            for path in blocked_paths)]
+        return sorted(actions + boundary_conflicts, key=_sort_key)
     local = _unique(local_items, "local")
     remote = _unique(box_items, "Box")
     base = {left.relative_path: (left, right) for left, right in baseline_pairs}
@@ -372,3 +409,44 @@ def _collapse_moves(actions: list[SyncAction]) -> list[SyncAction]:
         if not redundant:
             result.append(action)
     return result
+
+
+def _one_way_plan(
+    local_items: list[InventoryItem], box_items: list[InventoryItem],
+    folder_modes: tuple[tuple[str, str], ...],
+) -> list[SyncAction]:
+    local = _unique(local_items, "local")
+    remote = _unique(box_items, "Box")
+    folded = _casefold_paths(remote)
+    actions = []
+    for path, left in sorted(local.items()):
+        if path == "." or folder_mode(path, folder_modes) != "one-way":
+            continue
+        right = remote.get(path)
+        collision = _different_case_item(path, folded)
+        if left.item_type not in SYNCABLE:
+            actions.append(_conflict(path, right, f"unsupported local {left.item_type}"))
+        elif right is None and collision is not None:
+            actions.append(_conflict(path, collision,
+                "local name differs only by case from an existing Box item"))
+        elif right is not None and left.item_type != right.item_type:
+            actions.append(_conflict(path, right, "item types differ"))
+        elif right is None:
+            action = SyncAction("create_box_folder" if left.item_type == "folder" else "upload_new",
+                path, item_type=left.item_type, size=left.size, sha1=left.sha1,
+                reason="one-way: new local item")
+            actions.append(_bind_local_folder(action, left, local, path))
+        elif left.item_type == "file" and not _same_content(left, right):
+            actions.append(_action("upload_version", path, right, size=left.size, sha1=left.sha1,
+                                   reason="one-way: local version replaces Box"))
+    return actions
+
+
+def baseline_inventories(
+    local_items: list[InventoryItem], box_items: list[InventoryItem],
+    folder_modes: tuple[tuple[str, str], ...] = (),
+) -> tuple[list[InventoryItem], list[InventoryItem]]:
+    """Box-only items in upload-only folders are intentionally left unpaired."""
+    local_paths = {item.relative_path for item in local_items}
+    return local_items, [item for item in box_items
+        if item.relative_path in local_paths or folder_mode(item.relative_path, folder_modes) != "one-way"]

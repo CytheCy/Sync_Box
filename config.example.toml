@@ -17,3 +17,10 @@ exclude_names = ["Thumbs.db"]
 [storage]
 state_database = "/home/your-user/.local/state/sync-box/state.sqlite3"
 log_file = "/home/your-user/.local/state/sync-box/sync-box.log"
+
+# Optional per-folder directions; paths are relative to [local] root.
+# Subfolders inherit their nearest parent's setting. Default: two-way.
+# One-way uploads local versions, retaining Box-only files without downloading.
+[folder_modes]
+# "Obsidian20xx" = "one-way"
+# "Obsidian20xx/Shared" = "two-way"

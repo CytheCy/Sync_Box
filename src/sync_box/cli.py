@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 import sys
-from time import monotonic
+from time import monotonic, sleep
 
 from sync_box.box_auth import (
     AuthenticationError,
@@ -19,6 +19,7 @@ from sync_box.box_errors import safe_error_detail
 from sync_box.box_inventory import scan_box
 from sync_box.config import AppConfig, ConfigError, default_config_path, load_config
 from sync_box.database import (
+    upload_recovered_pairs,
     begin_sync_progress,
     clear_sync_progress,
     initialize_database,
@@ -27,7 +28,7 @@ from sync_box.database import (
     save_inventory,
     update_sync_progress,
 )
-from sync_box.inventory import ScanError, render_inventory, summarize
+from sync_box.inventory import ScanError, ScanChangedError, render_inventory, summarize
 from sync_box.initial_download import InitialDownloadError, execute_initial_download
 from sync_box.local_inventory import scan_local
 from sync_box.logging_setup import configure_logging, log_failure
@@ -42,7 +43,7 @@ from sync_box.planner import (
 from sync_box.two_way import (
     build_sync_plan, render_sync_plan, summarize_sync_plan, validate_baseline_match,
 )
-from sync_box.sync_engine import BoxMutations, SyncExecutionError, execute_sync
+from sync_box.sync_engine import BoxMutations, SyncExecutionError, SyncRetryNeeded, execute_sync
 from sync_box.systemd_units import (
     SystemdUnitError,
     find_invoked_executable,
@@ -215,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         if normal_execution:
             begin_sync_progress(config.state_database, "Scanning local files")
         try:
-            return _handle_run(args, config)
+            return _run_with_retries(args, config) if normal_execution else _handle_run(args, config)
         finally:
             if normal_execution:
                 clear_sync_progress(config.state_database)
@@ -453,7 +454,8 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
     generation, baseline_local_root, baseline_box_root, pairs = baseline
     if baseline_local_root != str(config.local_root) or baseline_box_root != config.box_folder_id:
         raise RuntimeError("Baseline roots do not match the current configuration")
-    plan = build_sync_plan(pairs, local_items, box_items)
+    pairs = upload_recovered_pairs(config.state_database, generation, str(config.local_root), config.box_folder_id, pairs)
+    plan = build_sync_plan(pairs, local_items, box_items, config.folder_modes)
     counts = summarize_sync_plan(plan)
     mode = "dry-run plan" if args.dry_run else "execution plan"
     print(
@@ -478,12 +480,13 @@ def _handle_run(args: argparse.Namespace, config: AppConfig) -> int:
             )
             if progress is not None:
                 progress.phase("Applying changes", total=len(plan))
-            return build_sync_plan(pairs, fresh_local, fresh_box)
+            return build_sync_plan(pairs, fresh_local, fresh_box, config.folder_modes)
 
         result = execute_sync(
             BoxMutations(write_client, config.box_folder_id), config.local_root,
             config.state_database, plan,
             baseline_generation=generation,
+            folder_modes=config.folder_modes,
             box_items_by_path={item.relative_path: item for item in box_items},
             refresh_box=lambda: BoxMutations(build_write_authenticated_client(config), config.box_folder_id),
             revalidate_plan=revalidate,
@@ -528,6 +531,52 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return parsed
+
+
+
+
+def _wait_for_quiet(config: AppConfig, *, quiet_seconds: float = 5, timeout: float = 60) -> bool:
+    """Wait for a stable metadata inventory, without hashing or holding sync locks."""
+    start = monotonic()
+    stable_since = start
+    previous = None
+    while monotonic() - start < timeout:
+        try:
+            current = scan_local(config.local_root, excluded_paths=config.excluded_paths,
+                                 excluded_names=config.excluded_names)
+        except ScanChangedError:
+            previous, stable_since = None, monotonic()
+            sleep(1)
+            continue
+        if current != previous:
+            previous, stable_since = current, monotonic()
+        elif monotonic() - stable_since >= quiet_seconds:
+            return True
+        sleep(1)
+    return False
+
+
+def _run_with_retries(args: argparse.Namespace, config: AppConfig) -> int:
+    for attempt in range(3):
+        try:
+            return _handle_run(args, config)
+        except (SyncRetryNeeded, ScanChangedError) as exc:
+            if isinstance(exc, ScanChangedError):
+                from sync_box.sync_engine import _exclusive_sync_lock
+                from sync_box.database import begin_sync_run, finish_sync_run
+                with _exclusive_sync_lock(config.state_database, config.local_root):
+                    baseline = load_baseline(config.state_database)
+                    run = begin_sync_run(config.state_database, [], baseline_generation=baseline[0],
+                                         local_root=str(config.local_root))
+                    finish_sync_run(config.state_database, run, "failed", "retry: local files changed during scan")
+            LOGGER.info("Sync deferred for fresh inventories: %s", exc)
+            if attempt == 2:
+                break
+            update_sync_progress(config.state_database, "Waiting for files to settle", 0)
+            if not _wait_for_quiet(config):
+                break
+    print("Files are still changing. Completed uploads are saved; another sync is pending.")
+    return 0
 
 
 if __name__ == "__main__":

@@ -14,10 +14,10 @@ import sys
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Qt, QUrl, Signal, QEvent
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressBar,
+    QMessageBox, QProgressBar, QPlainTextEdit, QTabWidget,
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
@@ -33,7 +33,8 @@ from sync_box.app_status import (
 )
 from sync_box.autostart import autostart_enabled, set_autostart
 from sync_box.box_errors import safe_error_detail
-from sync_box.config import ConfigError, default_config_path, load_config
+from sync_box.config import ConfigError, default_config_path, load_config, folder_mode, save_folder_mode
+from sync_box.inventory import is_excluded_path
 from sync_box.logging_setup import configure_logging, log_failure
 from sync_box.resources import cli_command, icon_path
 from sync_box.setup_config import SetupError, create_initial_config, default_state_directory
@@ -66,7 +67,7 @@ class _Task(QRunnable):
         super().__init__()
         self.operation = operation
         self.signals = _TaskSignals()
-        self.signals.finished.connect(callback)
+        self.signals.finished.connect(lambda result, error: callback(result, error))
 
     def run(self) -> None:
         try:
@@ -534,6 +535,125 @@ class SettingsDialog(QDialog):
             QTimer.singleShot(0, self.window.check_authentication)
 
 
+class FolderModeDialog(QDialog):
+    def __init__(self, settings: "FolderSettingsDialog", folder: str) -> None:
+        super().__init__(settings)
+        self.settings = settings
+        self.folder = folder
+        self.setWindowTitle("Edit folder direction")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        name = QLabel("All folders (default)" if folder == "." else folder)
+        name.setTextFormat(Qt.TextFormat.PlainText)
+        name.setWordWrap(True)
+        layout.addWidget(name)
+        self.direction = QComboBox()
+        self.direction.addItem("Two way (local ↔ Box)", "two-way")
+        self.direction.addItem("One way (local → Box)", "one-way")
+        self.direction.setCurrentIndex(self.direction.findData(folder_mode(folder, settings.config.folder_modes)))
+        self.direction.setAccessibleName("Sync direction")
+        layout.addWidget(self.direction)
+        self.explanation = QLabel()
+        self.explanation.setWordWrap(True)
+        layout.addWidget(self.explanation)
+        self.direction.currentIndexChanged.connect(self._describe)
+        self._describe()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _describe(self) -> None:
+        self.explanation.setText(
+            "Local files replace matching Box files, including files changed on Box. "
+            "New local files are uploaded. Box-only files stay on Box; nothing is downloaded "
+            "or deleted by this mode."
+            if self.direction.currentData() == "one-way" else
+            "Changes and deletions sync in both directions. Conflicting changes require review."
+        )
+        self.explanation.setText(self.explanation.text() +
+            " Applies to subfolders unless they have their own setting. Takes effect on the next sync.")
+
+    def _save(self) -> None:
+        try:
+            save_folder_mode(self.settings.window.provider.config_path,
+                             self.folder, self.direction.currentData())
+        except (OSError, ConfigError) as exc:
+            QMessageBox.warning(self, "Could not save folder setting", str(exc))
+            return
+        self.settings.reload()
+        self.settings.window.refresh_status()
+        self.accept()
+
+
+class FolderSettingsDialog(QDialog):
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Folder Setting")
+        self.resize(720, 460)
+        layout = QVBoxLayout(self)
+        explanation = QLabel("Choose a sync direction for each folder. Subfolders inherit their parent’s direction unless edited.")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Folder", "Direction", "Edit"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(1, 250)
+        self.table.setColumnWidth(2, 50)
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.reload()
+
+    def reload(self) -> None:
+        self.config = load_config(self.window.provider.config_path)
+        folders = {".", *(path for path, _ in self.config.folder_modes)}
+        # Include cloud folders from the verified inventory without a network request.
+        if self.config.state_database.is_file():
+            try:
+                from contextlib import closing
+                with closing(sqlite3.connect(f"file:{self.config.state_database}?mode=ro", uri=True)) as db:
+                    folders.update(row[0] for row in db.execute(
+                        "SELECT relative_path FROM baseline_items WHERE item_type='folder' "
+                        "AND generation_id=(SELECT generation_id FROM current_baseline WHERE singleton=1)"))
+            except sqlite3.Error:
+                pass
+        for parent, dirs, _files in os.walk(self.config.local_root, followlinks=False):
+            dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()
+                and not is_excluded_path((Path(parent) / name).relative_to(self.config.local_root).as_posix(),
+                                         self.config.excluded_paths, self.config.excluded_names)]
+            folders.update((Path(parent) / name).relative_to(self.config.local_root).as_posix() for name in dirs)
+        self.folders = sorted(folders)
+        explicit = dict(self.config.folder_modes)
+        self.table.setRowCount(len(self.folders))
+        for row, folder in enumerate(self.folders):
+            self.table.setItem(row, 0, QTableWidgetItem("All folders (default)" if folder == "." else folder))
+            mode = folder_mode(folder, self.config.folder_modes)
+            direction = "One way · local → Box" if mode == "one-way" else "Two way · local ↔ Box"
+            if folder not in explicit and folder != ".":
+                direction += " (inherited)"
+            direction_item = QTableWidgetItem(direction)
+            direction_item.setToolTip(direction)
+            self.table.setItem(row, 1, direction_item)
+            edit = QPushButton("✎")
+            icon = QIcon.fromTheme("document-edit")
+            if not icon.isNull():
+                edit.setIcon(icon)
+                edit.setText("")
+            edit.setToolTip(f"Edit {folder}")
+            edit.setAccessibleName(f"Edit direction for {folder}")
+            edit.clicked.connect(lambda _checked=False, path=folder: self.edit_folder(path))
+            self.table.setCellWidget(row, 2, edit)
+
+    def edit_folder(self, folder: str) -> None:
+        FolderModeDialog(self, folder).exec()
+
+
 class ConflictDialog(QDialog):
     """Show detected conflicts and apply safe local-name corrections."""
 
@@ -548,7 +668,7 @@ class ConflictDialog(QDialog):
         layout.setSpacing(10)
 
         layout.addWidget(_section("SYNC CONFLICT"))
-        title = QLabel("Choose how to correct the local name")
+        title = QLabel("Review and resolve a conflict")
         title.setObjectName("appTitle")
         layout.addWidget(title)
         self.paths = QComboBox()
@@ -564,7 +684,31 @@ class ConflictDialog(QDialog):
         self.explanation.setWordWrap(True)
         layout.addWidget(self.explanation)
 
+        self._preview = None
+        self._busy = False
+        self._tasks = []
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.setMinimumHeight(240)
+        self.preview_fields = {}
+        for key, title in (("local_preview", "Local"), ("box_preview", "Box"), ("diff", "Difference")):
+            field = QPlainTextEdit()
+            field.setReadOnly(True)
+            self.preview_tabs.addTab(field, title)
+            self.preview_fields[key] = field
+        layout.addWidget(self.preview_tabs)
+        self.backups_button = QPushButton("Open Backups")
+        self.backups_button.clicked.connect(self._open_backups)
+        preview_actions = QHBoxLayout()
+        self.refresh_preview_button = QPushButton("Refresh Preview")
+        self.refresh_preview_button.clicked.connect(self._refresh_preview)
+        preview_actions.addWidget(self.backups_button)
+        preview_actions.addWidget(self.refresh_preview_button)
+        layout.addLayout(preview_actions)
         actions = QHBoxLayout()
+        self.keep_local_button = QPushButton("Keep Local")
+        self.keep_box_button = QPushButton("Keep Box")
+        self.keep_local_button.clicked.connect(lambda: self._apply_resolution("keep_local"))
+        self.keep_box_button.clicked.connect(lambda: self._apply_resolution("keep_box"))
         self.open_button = QPushButton("Open Folder")
         self.custom_button = QPushButton("Choose Name…")
         self.suggested_button = QPushButton("Keep Both")
@@ -578,6 +722,8 @@ class ConflictDialog(QDialog):
         actions.addStretch()
         actions.addWidget(close_button)
         actions.addWidget(self.custom_button)
+        actions.addWidget(self.keep_local_button)
+        actions.addWidget(self.keep_box_button)
         actions.addWidget(self.suggested_button)
         layout.addLayout(actions)
         self._selection_changed()
@@ -594,6 +740,11 @@ class ConflictDialog(QDialog):
             self.custom_button.setEnabled(False)
             self.suggested_button.setEnabled(False)
             return
+        self._preview = None
+        self.keep_local_button.setEnabled(False)
+        self.keep_box_button.setEnabled(False)
+        self.backups_button.setEnabled(False)
+        self.refresh_preview_button.setEnabled(False)
         self.reason.setText(conflict.reason)
         supported = conflict.reason == LOCAL_CASE_CONFLICT_REASON
         if supported:
@@ -605,12 +756,133 @@ class ConflictDialog(QDialog):
                 f"local file to {suggestion!r}; Choose Name lets you enter another name."
             )
         else:
-            self.explanation.setText(
-                "This conflict cannot be corrected automatically. Open its folder "
-                "to review the files."
-            )
+            self.explanation.setText("Loading current versions and verified backups…")
+        self.preview_tabs.setVisible(not supported)
+        self.custom_button.setVisible(supported)
+        self.keep_local_button.setVisible(not supported)
+        self.keep_box_button.setVisible(not supported)
+        self.backups_button.setVisible(not supported)
+        self.refresh_preview_button.setVisible(not supported)
         self.custom_button.setEnabled(supported)
         self.suggested_button.setEnabled(supported)
+        if not supported:
+            self._load_preview(conflict.relative_path)
+
+    def reject(self) -> None:
+        if not self._busy:
+            super().reject()
+
+    def _run_task(self, operation, callback) -> None:
+        self._busy = True
+        self.paths.setEnabled(False)
+        self.refresh_preview_button.setEnabled(False)
+        self.window._resolution_busy = True
+        task = _Task(operation, callback)
+        self._tasks.append(task)
+        QThreadPool.globalInstance().start(task)
+
+    def _load_preview(self, path) -> None:
+        from sync_box.file_resolution import preview_file_conflict
+        self._run_task(lambda: preview_file_conflict(load_config(self.window.provider.config_path), path), self._preview_ready)
+
+    def _preview_ready(self, result, error) -> None:
+        self._busy = False
+        self.window._resolution_busy = False
+        self.paths.setEnabled(True)
+        self.refresh_preview_button.setEnabled(True)
+        if error:
+            self.explanation.setText(safe_error_detail(error))
+            for field in self.preview_fields.values():
+                field.clear()
+            return
+        selected = self.paths.findText(result["path"])
+        if selected >= 0 and selected != self.paths.currentIndex():
+            self.paths.blockSignals(True)
+            self.paths.setCurrentIndex(selected)
+            self.paths.blockSignals(False)
+            self.reason.setText("Resume the interrupted resolution for this file")
+        self._preview = result
+        for key, field in self.preview_fields.items():
+            field.setPlainText(result[key])
+        sizes = []
+        for side in ("local", "box"):
+            source = result["sources"].get(side)
+            sizes.append(f"{side.title()}: {source['size']:,} bytes · SHA-1 {source['sha1']}" if source else f"{side.title()}: missing")
+        description = "Keep Local uses the local version (or its deletion). Keep Box uses the Box version (or its deletion). Keep Both preserves every existing version."
+        if result.get("copy_path"):
+            description += f" Keep Both saves the local copy as: {result['copy_path']}."
+        if result["box_path"] != result["path"]:
+            description += f" Box moved this file to: {result['box_path']}."
+        if result["resume"]:
+            description = f"An interrupted resolution must resume its saved choice: {result['policy']}."
+        self.explanation.setText("\n".join(sizes) + "\n" + description + "\nVerified backups: " + result["backup_directory"])
+        for button, policy in ((self.keep_local_button, "keep_local"), (self.keep_box_button, "keep_box"),
+                               (self.suggested_button, "keep_both")):
+            button.setEnabled((not result["resume"] or result["policy"] == policy) and
+                              (policy != "keep_both" or result["keep_both_available"]))
+        self.backups_button.setEnabled(True)
+
+    def _refresh_preview(self) -> None:
+        conflict = self._selected()
+        if conflict is None:
+            return
+        if self._preview and self._preview["resume"]:
+            answer = QMessageBox.question(self, "Review the current versions?",
+                "Stop the pending resolution and create a fresh preview? Completed file changes remain in place and every backup is retained.")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            from sync_box.file_resolution import cancel_file_resolution
+            token = self._preview["token"]
+            self._run_task(lambda: cancel_file_resolution(load_config(self.window.provider.config_path), token),
+                           lambda result, error: self._cancel_finished(conflict.relative_path, error))
+        else:
+            self._selection_changed()
+
+    def _cancel_finished(self, path, error) -> None:
+        self._busy = False
+        self.window._resolution_busy = False
+        if error:
+            self._preview_ready(None, error)
+            return
+        self._selection_changed()
+
+    def _open_backups(self) -> None:
+        if self._preview:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._preview["backup_directory"]))
+
+    def _apply_resolution(self, policy: str) -> None:
+        if self._preview is None:
+            return
+        label = {"keep_local": "Keep Local", "keep_box": "Keep Box", "keep_both": "Keep Both"}[policy]
+        effect = ""
+        if policy == "keep_local" and "local" not in self._preview["sources"]:
+            effect = "This will delete the Box copy to keep the local deletion.\n\n"
+        elif policy == "keep_box" and "box" not in self._preview["sources"]:
+            effect = "This will delete the local copy to keep the Box deletion.\n\n"
+        answer = QMessageBox.question(self, f"Apply {label}?",
+            f"Apply {label} to {self._preview['path']}?\n\n" + effect +
+            "The reviewed versions have verified backups. If either file changed since the preview, the action will stop.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        from sync_box.file_resolution import execute_file_resolution
+        token = self._preview["token"]
+        for button in (self.keep_local_button, self.keep_box_button, self.suggested_button):
+            button.setEnabled(False)
+        self.explanation.setText("Applying the saved choice and verifying both copies…")
+        self._run_task(lambda: execute_file_resolution(load_config(self.window.provider.config_path), token, policy), self._resolution_finished)
+
+    def _resolution_finished(self, result, error) -> None:
+        self._busy = False
+        self.window._resolution_busy = False
+        if error:
+            self.refresh_preview_button.setEnabled(True)
+            self.explanation.setText(safe_error_detail(error) + "\nBackups are retained. Reopen Resolve Conflict to refresh or resume.")
+            self.paths.setEnabled(True)
+            return
+        QMessageBox.information(self, "Conflict resolved", "The selected conflict is resolved. Backups are saved in:\n" + result["backup_directory"])
+        self.accept()
+        self.window.refresh_status()
+        self.window.sync_now()
 
     def _open_parent(self) -> None:
         conflict = self._selected()
@@ -621,6 +893,9 @@ class ConflictDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(parent)))
 
     def _use_suggested_name(self) -> None:
+        if self._preview is not None:
+            self._apply_resolution("keep_both")
+            return
         conflict = self._selected()
         root = self.window.snapshot.local_folder
         if conflict is None or root is None:
@@ -672,6 +947,7 @@ class MainWindow(QMainWindow):
         self.preferences = load_preferences()
         self._login_pending = "--login" in sys.argv and self.preferences.sync_at_login
         self._dirty = False
+        self._resolution_busy = False
         self._history_rows = None
         self._history_task = None
         self._watch_error = None
@@ -802,6 +1078,9 @@ class MainWindow(QMainWindow):
         self.items = QLabel("No baseline")
         self.items.setObjectName("secondary")
         layout.addWidget(self.items)
+        self.folder_settings_button = QPushButton("Folder Setting")
+        self.folder_settings_button.clicked.connect(self.open_folder_settings)
+        layout.addWidget(self.folder_settings_button)
         layout.addSpacing(8)
 
         layout.addWidget(_section("BOX"))
@@ -890,6 +1169,10 @@ class MainWindow(QMainWindow):
                 self._request_refreshes = 0
                 snapshot = self.provider.read(auth_state=self.auth_state, account=self.account)
         self.snapshot = snapshot
+        if (snapshot.database.latest_summary or "").startswith("retry:") and not self._resolution_busy and snapshot.kind is not StatusKind.CONFLICT:
+            self._dirty = True
+            if not self.debounce.isActive():
+                self.debounce.start(5000)
         color = COLORS[snapshot.kind]
         self.header_status.setText(f"<span style='color:{color}'>●</span> {snapshot.title}")
         symbol = "✓" if snapshot.kind is StatusKind.UP_TO_DATE else "●"
@@ -950,6 +1233,7 @@ class MainWindow(QMainWindow):
             self.storage_bar.setFormat("Storage usage unavailable")
             self.storage_bar.setToolTip("Connect to Box to check your storage quota.")
         usable = snapshot.config is not None and snapshot.database.has_baseline
+        self.folder_settings_button.setEnabled(snapshot.config is not None)
         self.sync_button.setEnabled(usable and snapshot.kind is not StatusKind.SYNCING)
         self.sync_action.setEnabled(self.sync_button.isEnabled())
         self.open_folder_button.setEnabled(validated_local_folder(snapshot.config) is not None)
@@ -990,7 +1274,7 @@ class MainWindow(QMainWindow):
         if self.auth_state is not AuthenticationState.CONNECTED:
             self.debounce.start(30000)
             return
-        if self.sync_requested or self.snapshot.systemd.service.running:
+        if self._resolution_busy or self.sync_requested or self.snapshot.systemd.service.running:
             self.debounce.start(5000)
             return
         result = self.provider.controller.start_sync(self.snapshot.systemd)
@@ -1123,6 +1407,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Logs unavailable", "No log has been created yet.")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def open_folder_settings(self) -> None:
+        try:
+            FolderSettingsDialog(self).exec()
+        except (OSError, ConfigError) as exc:
+            QMessageBox.warning(self, "Folder settings unavailable", str(exc))
 
     def open_settings(self) -> None:
         SettingsDialog(self).exec()

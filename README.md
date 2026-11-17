@@ -21,6 +21,17 @@ changes settle for five seconds before requesting the existing systemd service;
 changes during a run are queued for another pass. Offline requests wait for the
 connection check to recover. Box connectivity is checked every minute.
 
+Click **Folder Setting** beneath the local folder to list folders and edit their
+sync direction with the pencil button. **Two way** is the default and syncs
+changes and deletions in both directions. **One way (local → Box)** uploads new
+local files and replaces matching Box files with the local version, including
+when Box has also changed. Box-only files stay on Box; one-way mode never
+downloads files or propagates deletions. Type and capitalization collisions still
+require review. A setting applies to all subfolders unless a subfolder has its
+own setting. Use **All folders (default)** to change the root's direction.
+Settings are saved in `[folder_modes]` in `config.toml` and apply to subsequent
+GUI and scheduled/CLI sync runs. Saving a setting does not start a sync.
+
 Preferences live in `~/.config/sync-box/desktop.json`. Schedule changes use a
 user timer drop-in and preserve the installed service. Transfer history reads
 the engine's durable operation journal, including failed and pending transfers;
@@ -216,7 +227,7 @@ but never traversed.
 
 ## Database and logs
 
-Initialize a new database or migrate an older database to schema v5:
+Initialize a new database or migrate an older database to schema v7:
 
 ```bash
 sync-box init
@@ -339,7 +350,52 @@ systemctl --user disable --now sync-box.timer
 sync-box systemd uninstall
 ```
 
-## Keep-both conflict resolution engine
+## Recovery and conflict resolution
+
+Each acknowledged upload immediately records the returned Box item ID, version,
+ETag, SHA-1, and size alongside the uploaded local fingerprint in SQLite. The next
+plan uses these per-file receipts as common ancestors even when the previous run
+could not commit a full baseline. A newer local edit can then upload normally;
+a divergent Box version and local edit still require conflict review. Receipts
+are scoped to the local root, Box root, and baseline generation. Unacknowledged
+requests are never inferred to have succeeded.
+
+If files change during final verification or preflight, the CLI waits for five
+quiet seconds before rescanning, with at most three passes per invocation. If the
+tree remains busy for a minute or the passes are exhausted, the GUI shows **Sync
+pending** and queues another attempt; a headless installation tries again on its
+next scheduled run. Confirmed upload receipts survive every retry and restart.
+
+Click **Resolve Conflict…** to view the current Local and Box versions, their
+sizes and hashes, and a text diff. Text previews are limited to 64 KiB per side;
+binary files show size and hash information. Before choices are enabled, the app
+creates verified copies of both existing versions outside the synchronized root
+in `conflict-backups/<token>/` beside the state database. **Open Backups** opens
+that directory; its manifest records the original paths and fingerprints.
+Backups are private and retained until you remove them yourself.
+
+- **Keep Local** puts the reviewed local version on both sides. A missing local
+  file means keeping its deletion, including deleting the Box file.
+- **Keep Box** puts the reviewed Box version on both sides, or preserves its move.
+  A missing Box file means keeping its deletion, including deleting the local file.
+- **Keep Both** keeps the Box version at its current path and saves the local
+  version under a name containing its SHA-1 prefix on both sides. When only one
+  version exists, it restores that version to the other side.
+
+Choices are confirmed against the preview before mutation. A file that changes
+after review stops the action. Each resolution journals its chosen destination
+state; it can resume after an interruption without repeating completed uploads.
+Other conflicts do not block resolving the selected file. Only the reviewed paths
+advance their baseline, atomically with the completed resolution record. Ordinary
+sync is blocked while a resolution is incomplete. **Refresh Preview** can release
+an interrupted choice for fresh review, retaining its completed changes and all
+backups. Folder/type conflicts and ambiguous occupied move destinations still
+require manual review; case-only filename collisions retain the existing rename
+workflow.
+
+The GUI uses `sync_box.file_resolution`. The original keep-both API remains
+available for callers of `sync_box.conflict_resolution`:
+
 
 The shared engine exposes structured keep-both planning and execution through
 `sync_box.conflict_resolution`. The first policy keeps the Box version at the

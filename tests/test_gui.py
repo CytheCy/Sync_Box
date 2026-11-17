@@ -56,7 +56,9 @@ class GuiBehaviorTests(unittest.TestCase):
 
     def make_window(self):
         provider = FakeProvider(Path(self.temporary.name))
-        with patch.object(MainWindow, "check_authentication"):
+        # PySide inspects class callables while connecting signals; a Mock here
+        # crashes the binding on Python 3.14 before the window can be tested.
+        with patch.object(MainWindow, "check_authentication", new=lambda self: None):
             window = MainWindow(provider)
         return window, provider
 

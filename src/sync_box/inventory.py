@@ -12,6 +12,10 @@ class ScanError(RuntimeError):
     """Raised when an inventory cannot be completed safely."""
 
 
+class ScanChangedError(ScanError):
+    """A local tree changed while it was being inventoried; retry a fresh scan."""
+
+
 @dataclass(frozen=True, slots=True)
 class InventoryItem:
     relative_path: str

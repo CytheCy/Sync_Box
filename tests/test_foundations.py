@@ -64,7 +64,7 @@ class FoundationTests(unittest.TestCase):
 
         with closing(sqlite3.connect(database_path)) as connection:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 6
+                connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
             for table in (
                 "item_baselines",

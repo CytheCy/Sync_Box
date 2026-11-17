@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from sync_box.inventory import InventoryItem
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MIGRATIONS = {
     1: "schema.sql",
     2: "migrations/0002_inventory.sql",
@@ -21,6 +21,7 @@ MIGRATIONS = {
     4: "migrations/0004_conflict_resolution.sql",
     5: "migrations/0005_sync_run_guard.sql",
     6: "migrations/0006_sync_progress.sql",
+    7: "migrations/0007_upload_recovery.sql",
 }
 
 
@@ -144,6 +145,9 @@ def replace_baseline(
         connection.execute("PRAGMA foreign_keys = ON")
         with connection:
             connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute("SELECT token FROM file_resolutions WHERE outcome='in_progress' LIMIT 1").fetchone()
+            if active:
+                raise RuntimeError("An interrupted file resolution must be resumed first")
             incomplete = connection.execute(
                 "SELECT id FROM conflict_resolution_runs "
                 "WHERE outcome='in_progress' LIMIT 1"
@@ -259,6 +263,9 @@ def begin_sync_run(
     with closing(sqlite3.connect(path)) as connection:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute("SELECT token FROM file_resolutions WHERE outcome='in_progress' LIMIT 1").fetchone()
+            if active:
+                raise RuntimeError("An interrupted file resolution must be resumed first")
             incomplete = connection.execute(
                 "SELECT id FROM conflict_resolution_runs "
                 "WHERE outcome='in_progress' LIMIT 1"
@@ -587,3 +594,49 @@ def replace_baseline_and_finish_resolution(
                 (generation, run_id),
             )
     return generation
+
+
+def record_upload_receipt(path: Path, generation: int, local_root: str, box_root: str,
+                          local: InventoryItem, remote: InventoryItem) -> None:
+    """Persist the API acknowledgement before marking an upload completed."""
+    if not (local.sha1 and remote.sha1 and local.sha1.lower() == remote.sha1.lower()
+            and remote.content_id and remote.version_id and remote.etag is not None
+            and local.size == remote.size):
+        raise RuntimeError("Upload acknowledgement has incomplete or mismatching fingerprints")
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO upload_receipts(generation_id, local_root, box_root_id, relative_path, local_json, box_json) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(generation_id, local_root, box_root_id, relative_path) "
+            "DO UPDATE SET local_json=excluded.local_json, box_json=excluded.box_json, recorded_at=CURRENT_TIMESTAMP",
+            (generation, local_root, box_root, local.relative_path,
+             json.dumps(local.to_dict()), json.dumps(remote.to_dict())))
+
+
+def upload_recovered_pairs(path: Path, generation: int, local_root: str, box_root: str, pairs):
+    """Use acknowledged uploads as per-file common ancestors, never infer success."""
+    result = {left.relative_path: (left, right) for left, right in pairs}
+    if not path.is_file():
+        return list(result.values())
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+        try:
+            rows = connection.execute(
+                "SELECT local_json, box_json FROM upload_receipts WHERE generation_id=? AND local_root=? AND box_root_id=?",
+                (generation, local_root, box_root)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []  # Read-only plans can precede the migration.
+    for local_json, box_json in rows:
+        left, right = InventoryItem(**json.loads(local_json)), InventoryItem(**json.loads(box_json))
+        result[left.relative_path] = (left, right)
+    return list(result.values())
+
+
+def active_file_resolution(path: Path):
+    if not path.is_file():
+        return None
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute("SELECT * FROM file_resolutions WHERE outcome='in_progress'").fetchone()
+        except sqlite3.OperationalError:
+            return None
+    return dict(row) if row else None
