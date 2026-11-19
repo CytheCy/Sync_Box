@@ -196,6 +196,100 @@ class GuiBehaviorTests(unittest.TestCase):
         dialog.deleteLater()
         window.deleteLater()
 
+    def test_reconnect_creates_login_even_without_saved_cli_environment(self):
+        from dataclasses import replace
+        window, _provider = self.make_window()
+        window.snapshot = replace(window.snapshot, config=object())
+        process = Mock()
+        with patch("sync_box.gui.QProcess", return_value=process), \
+             patch("sync_box.gui.cli_command", return_value=["python", "-m", "sync_box"]), \
+             patch.object(window, "refresh_status"):
+            window.authenticate()
+            window.authenticate()  # A second click must not launch another login.
+        process.start.assert_called_once_with("python", [
+            "-m", "sync_box", "--config", str(window.provider.config_path),
+            "auth", "login",
+        ])
+        self.assertTrue(window._reconnecting)
+        self.assertEqual(window.auth_state, AuthenticationState.CHECKING)
+        window.auth_process = None
+        window.deleteLater()
+
+    def test_reconnect_reports_timeout_even_when_box_cli_exits_zero(self):
+        window, _provider = self.make_window()
+        process = Mock()
+        process.readAllStandardOutput.return_value = b"Login timed out waiting for OAuth callback after 300 seconds."
+        process.readAllStandardError.return_value = b""
+        window.auth_process = process
+        window._reconnecting = True
+        with patch.object(window, "check_authentication") as check, \
+             patch("sync_box.gui.QMessageBox.warning") as warning:
+            window._login_finished(0, None)
+        check.assert_not_called()
+        self.assertIn("login expired", warning.call_args.args[2])
+        self.assertIn("try Reconnect Box again", warning.call_args.args[2])
+        self.assertIsNone(window.auth_process)
+        self.assertFalse(window._reconnecting)
+        process.deleteLater.assert_called_once()
+        window.deleteLater()
+
+    def test_reconnect_handles_failure_to_start(self):
+        window, _provider = self.make_window()
+        process = Mock()
+        process.readAllStandardOutput.return_value = b""
+        process.readAllStandardError.return_value = b""
+        process.errorString.return_value = "Executable not found"
+        window.auth_process = process
+        window._reconnecting = True
+        with patch("sync_box.gui.QMessageBox.warning") as warning:
+            window._login_finished(1, None)
+            window._login_finished(1, None)  # Error/finished signals may both fire.
+        warning.assert_called_once()
+        self.assertIn("Executable not found", warning.call_args.args[2])
+        self.assertIsNone(window.auth_process)
+        self.assertFalse(window._reconnecting)
+        window.deleteLater()
+
+    def test_login_success_still_requires_verified_account_access(self):
+        window, _provider = self.make_window()
+        process = Mock()
+        process.readAllStandardOutput.return_value = b"Successfully logged in"
+        process.readAllStandardError.return_value = b""
+        window.auth_process = process
+        window._reconnecting = True
+        with patch.object(window, "check_authentication") as check:
+            window._login_finished(0, None)
+        check.assert_called_once()
+        self.assertTrue(window._reconnecting)
+        verification = Mock()
+        verification.readAllStandardOutput.return_value = b""
+        verification.readAllStandardError.return_value = b"access_token=secret credential unavailable"
+        window.auth_process = verification
+        with patch("sync_box.gui.QMessageBox.warning") as warning:
+            window._authentication_finished(1, None)
+        self.assertNotIn("secret", warning.call_args.args[2])
+        self.assertIn("credential unavailable", warning.call_args.args[2])
+        self.assertFalse(window._reconnecting)
+        window.deleteLater()
+
+    def test_settings_connection_updates_after_browser_login(self):
+        from dataclasses import replace
+        window, _provider = self.make_window()
+        dialog = SettingsDialog(window)
+        window._reconnecting = True
+        window.auth_process = Mock()
+        dialog._update_account()
+        self.assertFalse(dialog.auth.isEnabled())
+        self.assertIn("browser", dialog.account.text())
+        window._reconnecting = False
+        window.auth_process = None
+        window.snapshot = replace(window.snapshot, auth_state=AuthenticationState.CONNECTED, account="Person")
+        dialog._update_account()
+        self.assertEqual(dialog.account.text(), "Person")
+        self.assertTrue(dialog.auth.isEnabled())
+        dialog.deleteLater()
+        window.deleteLater()
+
     def test_conflict_policy_setting_loads_and_saves(self):
         from dataclasses import replace
         from sync_box.config import load_config, save_conflict_policy

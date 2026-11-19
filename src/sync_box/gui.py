@@ -499,6 +499,9 @@ class SettingsDialog(QDialog):
             if label:
                 label.hide()
         self._update_account()
+        self.account_timer = QTimer(self)
+        self.account_timer.timeout.connect(self._update_account)
+        self.account_timer.start(500)
 
     def _browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose local Box folder")
@@ -506,6 +509,10 @@ class SettingsDialog(QDialog):
             self.local.setText(folder)
 
     def _update_account(self) -> None:
+        self.auth.setEnabled(self.window.auth_process is None)
+        if self.window._reconnecting:
+            self.account.setText("Finish signing in and grant access to Box in your browser…")
+            return
         if self.window.snapshot.auth_state is AuthenticationState.CONNECTED:
             self.account.setText(self.window.snapshot.account or "Connected")
         elif self.window.snapshot.auth_state is AuthenticationState.REQUIRED:
@@ -973,6 +980,7 @@ class MainWindow(QMainWindow):
         self._request_refreshes = 0
         self._quitting = False
         self.auth_process: QProcess | None = None
+        self._reconnecting = False
         self.setup_wizard: SetupWizard | None = None
         self.snapshot = self.provider.read()
         self.setWindowTitle("Box Cloud Sync")
@@ -1377,19 +1385,50 @@ class MainWindow(QMainWindow):
         command = cli_command()
         process = QProcess(self)
         self.auth_process = process
+        self._reconnecting = True
+        self.auth_state = AuthenticationState.CHECKING
+        self.refresh_status()
         process.finished.connect(self._login_finished)
-        process.start(command[0], [*command[1:], "--config", str(self.provider.config_path), "auth", "login", "--reauthorize"])
+        process.errorOccurred.connect(lambda _error: self._login_finished(1, QProcess.ExitStatus.CrashExit) if self.auth_process is process else None)
+        # The official-app login replaces its named environment after success.
+        # Unlike --reauthorize, it also works if that environment was removed.
+        process.start(command[0], [*command[1:], "--config", str(self.provider.config_path), "auth", "login"])
 
     def _login_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        process = self.auth_process
         self.auth_process = None
-        if exit_code == 0:
+        if process is None:
+            return
+        output = bytes(process.readAllStandardOutput()).decode(errors="replace")
+        errors = bytes(process.readAllStandardError()).decode(errors="replace")
+        # Some Box CLI versions exit successfully after callback failures/timeouts.
+        failure = next((safe_error_detail(line) for line in (output + "\n" + errors).splitlines()
+                        if any(marker in line.lower() for marker in (
+                            "login failed", "login timed out", "error:",
+                            "does not exist", "not of type oauth20",
+                        ))), "")
+        if "timed out" in failure.lower():
+            failure = (
+                "Box sign-in did not return to Sync_Box before the login expired. "
+                "If your browser shows your Box files, try Reconnect Box again "
+                "now that you are signed in, then choose Grant access to Box."
+            )
+        start_error = process.errorString()
+        process.deleteLater()
+        if exit_code == 0 and not failure:
             self.check_authentication()
             return
+        self._reconnecting = False
         self.auth_state = AuthenticationState.REQUIRED
         self.account = None
         self.box_space_used = None
         self.box_space_amount = None
         self.refresh_status()
+        QMessageBox.warning(
+            self, "Box reconnection failed",
+            failure or (safe_error_detail(errors) if errors.strip() else
+                        f"Could not complete Box sign-in. {safe_error_detail(start_error)}"),
+        )
 
     def _authentication_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         process = self.auth_process
@@ -1397,6 +1436,7 @@ class MainWindow(QMainWindow):
         if process is None:
             return
         output = bytes(process.readAllStandardOutput()).decode(errors="replace").strip()
+        errors = bytes(process.readAllStandardError()).decode(errors="replace")
         process.deleteLater()
         if exit_code == 0:
             account = _parse_account_status(output)
@@ -1413,7 +1453,16 @@ class MainWindow(QMainWindow):
             self.account = None
             self.box_space_used = None
             self.box_space_amount = None
+        reconnecting = self._reconnecting
+        self._reconnecting = False
         self.refresh_status()
+        if reconnecting and self.auth_state is not AuthenticationState.CONNECTED:
+            detail = safe_error_detail(errors)
+            QMessageBox.warning(
+                self, "Box reconnection failed",
+                "Box sign-in finished, but Sync_Box could not verify access. "
+                + (detail or "Try Reconnect Box again and complete sign-in in the browser."),
+            )
         if self._login_pending or self._dirty:
             self.debounce.start(1000)
 

@@ -21,6 +21,13 @@ changes settle for five seconds before requesting the existing systemd service;
 changes during a run are queued for another pass. Offline requests wait for the
 connection check to recover. Box connectivity is checked every minute.
 
+Use **Settings → Reconnect Box** to renew Box access. Complete sign-in in the
+browser and choose **Grant access to Box**; Settings updates after the app
+verifies the connection. Signing into the Box website alone does not reconnect
+the app. If the browser only opens your Box files and the login expires, click
+**Reconnect Box** again while signed in and complete the access grant. Failed
+or expired login attempts display an error in the app.
+
 Click **Folder Setting** beneath the local folder to list folders and edit their
 sync direction with the pencil button. **Two way** is the default and syncs
 changes and deletions in both directions. **One way (local → Box)** uploads new
